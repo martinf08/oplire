@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# Rotation automatique des proxies OpenCode sur 429.
+# Le veilleur démarre aussi le proxy local (127.0.0.1:8899) si besoin.
+
+name="proxy-rotate"
+description="Rotation automatique de proxies OpenCode sur 429"
+
+command="/usr/local/bin/proxy-rotate"
+command_args="watch"
+command_background=true
+pidfile="/run/proxy-rotate/watch.pid"
+output_log="/var/log/proxy-rotate.log"
+error_log="/var/log/proxy-rotate.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    mkdir -p /run/proxy-rotate
+    checkpath --file --mode 0644 /var/log/proxy-rotate.log
+}

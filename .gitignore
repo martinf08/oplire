@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+*.log
+*.tar.gz
+.env

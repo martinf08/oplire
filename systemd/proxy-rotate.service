@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotation automatique de proxies OpenCode sur 429
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/proxy-rotate watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

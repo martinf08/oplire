@@ -1,0 +1,179 @@
+#!/bin/sh
+# ==============================================================================
+# reset-opencode-default — remet la machine sur la connexion PAR DÉFAUT
+# (sans Cloudflare WARP), en annulant tout ce que fait oplire/reset-opencode.
+#
+# Utilisation :
+#   reset-opencode-default            # coupe WARP, restaure la connexion par défaut
+#   reset-opencode-default --dry-run  # affiche les actions sans rien modifier
+#   reset-opencode-default --purge    # idem + supprime les fichiers WARP
+#                                     # (sauvegarde d'abord dans <état>/warp-backup-*.tar.gz)
+#
+# Le script est idempotent : le lancer quand WARP est déjà coupé ne casse rien.
+# ==============================================================================
+
+set -u
+
+# Répertoire des fichiers WARP (wgcf) et des sauvegardes.
+STATE_DIR="${OPLIRE_STATE_DIR:-/root}"
+
+DRY=0
+PURGE=0
+HERE=$(basename "$0")
+
+usage() {
+    cat <<EOF
+Usage: $HERE [--dry-run|-n] [--purge|-p] [--help|-h]
+
+  (sans option)   coupe le tunnel WARP et restaure la connexion par défaut
+  --dry-run, -n   montre ce qui serait fait, sans modification
+  --purge, -p     en plus : supprime /etc/wireguard/wg0.conf et les fichiers wgcf
+                  (sauvegarde préalable dans <état>/warp-backup-<date>.tar.gz)
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n) DRY=1 ;;
+        --purge|-p)   PURGE=1 ;;
+        --help|-h)    usage; exit 0 ;;
+        *)            echo "Option inconnue : $arg" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+say() { printf '%s\n' "$*"; }
+
+# Depuis la box dev : re-exécuter sur l'hôte.
+if [ -d /run/host ] && [ -x /run/host/usr/local/bin/reset-opencode-default ]; then
+    exec chroot /run/host /usr/local/bin/reset-opencode-default "$@"
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    if [ "$DRY" -eq 0 ] && command -v doas >/dev/null 2>&1; then
+        exec doas "$0" "$@"
+    elif [ "$DRY" -eq 0 ] && command -v sudo >/dev/null 2>&1; then
+        exec sudo "$0" "$@"
+    else
+        say "Erreur : ce script doit tourner en root." >&2
+        exit 1
+    fi
+fi
+
+run() {
+    if [ "$DRY" -eq 1 ]; then
+        say "  [dry-run] $*"
+    else
+        "$@" >/dev/null 2>&1 || true
+    fi
+}
+
+say "=================================================="
+say "  Retour à la connexion par défaut (sans WARP)"
+say "=================================================="
+
+# 1. Arrêter le démon / proxy oplire s'il tourne.
+say "[1/5] Arrêt du démon oplire..."
+if [ "$DRY" -eq 1 ]; then
+    say "  [dry-run] oplire stop"
+else
+    oplire stop >/dev/null 2>&1 || true
+    pkill -f 'oplire (watch|daemon)' 2>/dev/null || true
+fi
+
+# 2. Descendre le tunnel WireGuard.
+say "[2/5] Désactivation du tunnel wg0..."
+if ip link show wg0 >/dev/null 2>&1; then
+    if [ "$DRY" -eq 1 ]; then
+        say "  [dry-run] wg-quick down wg0"
+    else
+        wg-quick down wg0 >/dev/null 2>&1 || ip link del wg0 >/dev/null 2>&1 || true
+        warp-cli disconnect >/dev/null 2>&1 || true
+    fi
+else
+    say "  -> wg0 déjà absent"
+fi
+
+# 3. Nettoyer les règles de routage laissées par wg-quick / warp-cli.
+say "[3/5] Nettoyage des règles de routage..."
+LAN=$(ip -4 route show scope link 2>/dev/null | awk '/proto kernel/ {print $1}' | paste -sd, -)
+[ -n "$LAN" ] || LAN="" 
+
+cleanup_rule() {
+    # $1 = motif exact de la règle, $2 = priorité
+    if ip rule show 2>/dev/null | grep -q "priority $2"; then
+        if [ "$DRY" -eq 1 ]; then
+            say "  [dry-run] ip rule del priority $2"
+        else
+            ip rule del priority "$2" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+[ -n "$LAN" ] && cleanup_rule "to $LAN lookup main" 100
+# wg-quick pose ces deux règles pour le fwmark 0xca6c ; elles partent avec
+# le `wg-quick down`, mais on nettoie les résidus d'un arrêt brutal.
+if ip rule show 2>/dev/null | grep -q 'lookup 51820'; then
+    PRIO=$(ip rule show | awk '/lookup 51820/ {gsub(":", "", $1); print $1; exit}')
+    [ -n "$PRIO" ] && cleanup_rule "" "$PRIO"
+fi
+if ip rule show 2>/dev/null | grep -q 'suppress_prefixlength 0'; then
+    PRIO=$(ip rule show | awk '/suppress_prefixlength 0/ {gsub(":", "", $1); print $1; exit}')
+    [ -n "$PRIO" ] && cleanup_rule "" "$PRIO"
+fi
+
+# 4. Vérifications : route par défaut, DNS, IP publique, warp=off.
+say "[4/5] Vérification de la connexion par défaut..."
+DEFROUTE=$(ip route show default 2>/dev/null | grep -v ' dev wg0' | head -n 1)
+if [ -n "$DEFROUTE" ]; then
+    say "  -> Route par défaut : $DEFROUTE"
+else
+    say "  -> [AVERTISSEMENT] aucune route par défaut hors wg0" >&2
+fi
+
+NS=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
+say "  -> DNS : ${NS:-absent}"
+
+TRACE=$(curl -fsS --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+IP=$(printf '%s\n' "$TRACE" | grep '^ip=' | cut -d= -f2)
+WARP_STATE=$(printf '%s\n' "$TRACE" | grep '^warp=' | cut -d= -f2)
+
+if [ "$DRY" -eq 1 ]; then
+    say "  [dry-run] pas de test réseau (état actuel : warp=${WARP_STATE:-inconnu}, ip=${IP:-inconnue})"
+elif [ "$WARP_STATE" = "off" ]; then
+    say "  -> WARP : OFF (connexion par défaut)"
+    say "  -> IP publique : ${IP:-inconnue}"
+elif [ -z "$WARP_STATE" ]; then
+    say "  -> [AVERTISSEMENT] pas de réponse du test réseau" >&2
+else
+    say "  -> [ERREUR] WARP toujours actif (warp=$WARP_STATE, ip=${IP:-?})" >&2
+    exit 1
+fi
+
+# 5. Purge optionnelle des fichiers WARP.
+if [ "$PURGE" -eq 1 ]; then
+    say "[5/5] Suppression des fichiers WARP (sauvegarde préalable)..."
+    STAMP=$(date +%Y%m%d-%H%M%S)
+    BACKUP="$STATE_DIR/warp-backup-$STAMP.tar.gz"
+    FILES="/etc/wireguard/wg0.conf $STATE_DIR/wgcf-account.toml $STATE_DIR/wgcf-profile.conf /var/lib/cloudflare-warp"
+    if [ "$DRY" -eq 1 ]; then
+        say "  [dry-run] tar czf $BACKUP $FILES"
+        say "  [dry-run] rm -f /etc/wireguard/wg0.conf $STATE_DIR/wgcf-account.toml $STATE_DIR/wgcf-profile.conf"
+        say "  [dry-run] rm -rf /var/lib/cloudflare-warp"
+    else
+        # shellcheck disable=SC2086
+        tar czf "$BACKUP" $FILES 2>/dev/null || true
+        rm -f /etc/wireguard/wg0.conf "$STATE_DIR/wgcf-account.toml" "$STATE_DIR/wgcf-profile.conf"
+        rm -rf /var/lib/cloudflare-warp
+        say "  -> Sauvegarde : $BACKUP"
+    fi
+else
+    say "[5/5] Fichiers WARP conservés (utiliser --purge pour les supprimer)."
+fi
+
+say "=================================================="
+if [ "$DRY" -eq 1 ]; then
+    say "  Dry-run terminé : aucune modification appliquée."
+else
+    say "  Connexion par défaut restaurée (WARP coupé)."
+    say "  Pour réactiver un tunnel : reset-opencode"
+fi
+say "=================================================="

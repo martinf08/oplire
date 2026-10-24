@@ -1,0 +1,122 @@
+#!/bin/sh
+# ==============================================================================
+# proxy-hunt — rafraîchit le pool proxy-rotate depuis des listes publiques.
+#
+# Télécharge plusieurs listes, teste les proxies en parallèle (HTTPS réel),
+# puis importe les survivants dans la base du pool (proxy-rotate import).
+#
+# Utilisation :
+#   proxy-hunt                  # ~1500 candidats, 100 en parallèle
+#   proxy-hunt --limit 400      # plus rapide
+#   proxy-hunt --prune          # supprime aussi les proxies morts de la base
+#   proxy-hunt --jobs 200 --timeout 8
+# ==============================================================================
+
+set -u
+
+JOBS=100
+TIMEOUT=6
+LIMIT=1500
+PRUNE=0
+WORK="${PROXY_HUNT_DIR:-/tmp/opencode/proxies}"
+TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+CHECK_URL="https://opencode.ai/"
+
+usage() {
+    cat <<EOF
+Usage: proxy-hunt [--limit N] [--jobs N] [--timeout S] [--prune]
+
+  --limit N     nombre de candidats testés (défaut 1500)
+  --jobs N      tests en parallèle (défaut 100)
+  --timeout S   timeout curl par test (défaut 6)
+  --prune       supprime les proxies 'dead' avant l'import
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --limit)   LIMIT="$2"; shift 2 ;;
+        --jobs)    JOBS="$2"; shift 2 ;;
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        --prune)   PRUNE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Option inconnue : $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+command -v curl >/dev/null 2>&1 || { echo "curl requis" >&2; exit 1; }
+command -v proxy-rotate >/dev/null 2>&1 || { echo "proxy-rotate requis" >&2; exit 1; }
+
+mkdir -p "$WORK" || exit 1
+cd "$WORK" || exit 1
+
+say() { printf '%s\n' "$*"; }
+
+say "Téléchargement des listes..."
+fetch() {
+    name="$1"; url="$2"
+    if curl -fsSL --max-time 30 -o "$name.raw" "$url"; then
+        say "  $name : $(wc -l < "$name.raw") lignes"
+    else
+        say "  $name : échec (ignoré)"
+        rm -f "$name.raw"
+    fi
+}
+
+fetch proxifly "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt"
+fetch speedx   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"
+fetch monosans "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
+fetch clarketm "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt"
+
+# Normalisation : uniquement HTTP, host:port, dédupliqué.
+{
+    [ -f proxifly.raw ] && grep -E '^http://' proxifly.raw | sed 's#^http://##'
+    for f in speedx monosans clarketm; do
+        [ -f "$f.raw" ] && cat "$f.raw"
+    done
+} | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$' \
+  | sort -u > candidates.txt
+
+TOTAL=$(wc -l < candidates.txt)
+[ "$TOTAL" -gt 0 ] || { say "Aucun candidat." >&2; exit 1; }
+say "Candidats uniques : $TOTAL"
+
+# Échantillon aléatoire pour varier à chaque exécution.
+awk 'BEGIN{srand()} {print rand()" "$0}' candidates.txt \
+  | sort -n | cut -d' ' -f2- | head -n "$LIMIT" > sample.txt
+
+cat > test-one.sh <<'EOF'
+#!/bin/sh
+p="$1"; t="$2"
+body=$(curl -sS -x "http://$p" --max-time "$t" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || exit 0
+printf '%s' "$body" | grep -q '^ip=' || exit 0
+code=$(curl -sS -x "http://$p" --max-time "$t" -o /dev/null -w '%{http_code}' https://opencode.ai/ 2>/dev/null) || exit 0
+[ -n "$code" ] && [ "$code" -ge 200 ] && [ "$code" -lt 500 ] && printf '%s\n' "$p"
+EOF
+chmod +x test-one.sh
+
+say "Test 1/2 ($(wc -l < sample.txt) candidats, $JOBS parallèles)..."
+xargs -P "$JOBS" -I{} sh test-one.sh {} "$TIMEOUT" < sample.txt > alive.txt
+say "  -> $(wc -l < alive.txt) répondent"
+
+if [ ! -s alive.txt ]; then
+    say "Aucun proxy viable cette fois."
+    exit 1
+fi
+
+say "Test 2/2 (stabilité)..."
+sleep 3
+xargs -P "$JOBS" -I{} sh test-one.sh {} "$TIMEOUT" < alive.txt > stable.txt
+say "  -> $(wc -l < stable.txt) stables"
+
+if [ "$PRUNE" -eq 1 ]; then
+    proxy-rotate prune
+fi
+
+if [ -s stable.txt ]; then
+    proxy-rotate import stable.txt --source hunt
+    proxy-rotate status
+else
+    say "Aucun proxy stable."
+    exit 1
+fi
