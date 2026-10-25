@@ -1,49 +1,46 @@
-# oplire
+# Oplire
 
-`oplire` combines a small Anthropic-compatible API bridge for an
-OpenAI/OpenCode-compatible chat API, a health-check CLI, and optional Linux
-utilities for manually managing authorized proxies.
+Oplire is a small local API bridge and diagnostics CLI. It lets Anthropic-compatible
+clients use an OpenAI-compatible chat API and provides optional Linux utilities
+for manually managing authorized proxies.
 
-**An HTTP 429 or quota response never triggers an IP/proxy rotation, a WARP
-reset, or a retry.** The bridge forwards the upstream status, response body,
-and `Retry-After` header. Honor the indicated delay and the provider's terms.
+> **HTTP 429 and quota safety:** Oplire never retries a rate-limited request,
+> rotates an IP address or proxy, or resets WARP in response to HTTP 429. The
+> bridge forwards the upstream status, response body, and `Retry-After` header.
+> Follow the provider's indicated wait time and terms.
 
 ## Features
 
-- `POST /v1/messages` converts text-only Anthropic requests to upstream
-  `POST /v1/chat/completions` requests.
-- JSON responses and text SSE streams, model-list endpoints, and a local health
-  endpoint.
-- Images and Anthropic tools are rejected explicitly instead of being silently
-  dropped.
-- CLI commands: `oplire proxy`, `oplire check`, and `oplire models`.
-- `bin/reset-opencode` remains as a compatibility launcher. It starts OpenCode
-  without changing networking or sending a test generation. `--check URL` runs
-  an explicit endpoint check first.
-- `bin/proxy-rotate` retains manual management for user-configured, authorized
-  proxies. Its watcher reports 429s without switching proxies. Automatic
-  changes are limited to connectivity failures.
-- `bin/proxy-hunt` is disabled; it does not collect or test public proxy lists.
+- `POST /v1/messages` translates text-only Anthropic requests to
+  `POST /v1/chat/completions`.
+- Supports JSON responses and server-sent event (SSE) streams.
+- Provides model-list and local health endpoints.
+- Rejects images and tool use explicitly rather than silently dropping them.
+- Includes the `oplire proxy`, `oplire check`, and `oplire models` CLI commands.
+- Binds to `127.0.0.1:8080` by default and targets
+  `http://127.0.0.1:3000` by default.
 
-The bridge binds to `127.0.0.1:8080` by default and targets
-`http://127.0.0.1:3000`. It is restricted to loopback. For remote access, place
-an authenticated reverse proxy in front of it and apply appropriate network
-controls.
+The bridge is restricted to loopback. For remote access, put an authenticated
+reverse proxy in front of it and apply appropriate network controls.
+
+## Requirements
+
+- Rust stable and Cargo.
+- Python 3 to run the legacy-script tests.
+- On Debian or Ubuntu, `build-essential` may be needed by native dependencies.
 
 ## Build and test
-
-Rust stable and Cargo are required. On Debian/Ubuntu, `build-essential` may be
-needed by native dependencies.
 
 ```sh
 cargo fmt --all -- --check
 cargo test --locked
 cargo build --release --locked
 ./target/release/oplire --help
+python3 -m unittest discover -s tests -v
 ```
 
-Tests use local HTTP servers. They verify, among other things, that an upstream
-429 and its `Retry-After` header are forwarded without a retry.
+The tests use local HTTP servers. They verify that HTTP 429 and `Retry-After`
+are forwarded without replaying the request.
 
 ## Run the bridge
 
@@ -56,9 +53,11 @@ OPLIRE_LISTEN=127.0.0.1:8080 \
 ./target/release/oplire proxy
 ```
 
-If the upstream requires a bearer token, set `OPLIRE_API_KEY` in the process
-environment; do not put it in the repository or command history. Equivalent
-CLI usage:
+If the upstream requires a bearer token, provide it through the process
+environment as `OPLIRE_API_KEY`. Do not commit credentials or put them in shell
+history.
+
+Equivalent CLI commands:
 
 ```sh
 oplire proxy --listen 127.0.0.1:8080 --upstream http://127.0.0.1:3000
@@ -66,27 +65,32 @@ oplire check --url http://127.0.0.1:3000/health --attempts 3
 oplire models
 ```
 
-`oplire check` retries only bounded network errors and transient server errors.
-It stops immediately on HTTP 429 and displays `Retry-After` when present.
+The bridge exposes `GET /health`, `GET /v1/models`, and
+`GET /v1/models/{model_id}` in addition to `POST /v1/messages`.
 
-To use the bridge with an Anthropic-compatible client, set its endpoint to
-`http://127.0.0.1:8080` and choose a model provided by the upstream. Oplire
-does not provide accounts or free provider access.
+`oplire check` retries only bounded network errors and transient server errors.
+It stops immediately on HTTP 429 and reports `Retry-After` when present.
+
+To use the bridge, configure an Anthropic-compatible client with the endpoint
+`http://127.0.0.1:8080` and a model supported by the upstream. Oplire does not
+provide accounts or free provider access.
+
+## Install
+
+`install.sh` installs the Rust binary and Linux scripts. System-service
+installation is opt-in:
+
+```sh
+sudo ./install.sh                 # Install the binary and scripts; no boot service
+sudo ./install.sh --with-service  # Also enable the OpenRC/systemd watcher
+sudo ./install.sh --no-binary     # Install scripts only
+sudo ./install.sh --dry-run       # Preview the requested actions
+```
 
 ## Legacy Linux utilities
 
-`install.sh` installs the Rust binary with Cargo and the Linux scripts. System
-service installation is opt-in:
-
-```sh
-sudo ./install.sh                 # binary and scripts; no boot service
-sudo ./install.sh --with-service  # opt in to OpenRC/systemd watcher
-sudo ./install.sh --no-binary     # scripts only; do not install the bridge
-sudo ./install.sh --dry-run
-```
-
-The legacy proxy pool is only for proxies you are authorized to use and
-legitimate networking purposes. To configure one manually:
+The legacy proxy pool is for proxies you are authorized to use and legitimate
+networking purposes only. Configure proxies manually:
 
 ```sh
 proxy-rotate init
@@ -96,25 +100,28 @@ proxy-rotate use ID
 proxy-rotate status
 ```
 
-`proxy-rotate 429` is informational and has no network effect. The watcher
-does not switch proxies on 429; it can report a limit in its log. The manual
-`proxy-rotate rotate` command must not be used to evade limits or quotas. Public
-proxies are untrusted and should not carry credentials or sensitive data.
+`proxy-rotate 429` is informational and has no network effect. The watcher can
+report a limit in its log but never switches proxies on HTTP 429. The manual
+`proxy-rotate rotate` command must not be used to evade provider limits or
+quotas. Public proxies are untrusted; do not send them credentials or sensitive
+data.
 
-`reset-opencode-default` is a separate legacy utility for manually disabling
-WARP. The bridge and launcher never call it, and it is not part of 429 handling.
-Review its options before use; `--purge` deletes system files after making a
-backup.
+`bin/proxy-hunt` is disabled and does not collect or test public proxy lists.
+`bin/reset-opencode` is a compatibility launcher that starts OpenCode without
+changing networking or sending a test generation. `reset-opencode-default` is
+a separate legacy WARP administration utility; it is not called by the bridge
+or by HTTP 429 handling. Review its options before use. Its `--purge` option
+deletes system files after making a backup.
 
 ## Legacy pool configuration
 
-Paths can be configured with `OPLIRE_STATE_DIR`, `OPLIRE_DB`,
-`OPLIRE_ENV_FILE`, `OPLIRE_PROFILE_FILE`, `OPLIRE_RUN_DIR`, and
-`OPENCODE_LOG`. The proxy environment file may contain credentials: keep it
-private and out of version control.
+The legacy utilities support `OPLIRE_STATE_DIR`, `OPLIRE_DB`,
+`OPLIRE_ENV_FILE`, `OPLIRE_PROFILE_FILE`, `OPLIRE_RUN_DIR`, and `OPENCODE_LOG`.
+The proxy environment file may contain credentials; keep it private and out of
+version control.
 
 ## License and attribution
 
-Distributed under the MIT License. Some API transformations and bridge
-structure are adapted from `BerkeOruc/oplire` (copyright Berke Oruc); see
-`LICENSE` for required notices.
+Oplire is distributed under the MIT License. Some API transformations and
+bridge structure are adapted from `BerkeOruc/oplire`; see `LICENSE` for the
+required copyright and license notices.
