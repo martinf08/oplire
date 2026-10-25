@@ -1,5 +1,5 @@
 [Unit]
-Description=Rotation automatique de proxies OpenCode sur 429
+Description=Connectivity watcher for configured Oplire proxies
 After=network-online.target
 Wants=network-online.target
 

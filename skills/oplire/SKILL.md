@@ -1,115 +1,45 @@
 ---
 name: oplire
-description: Reset Cloudflare WARP IP or rotate a proxy pool to bypass OpenCode 429 Rate Limit (Free usage limit reached) or Quota Exceeded errors.
+description: Check an OpenCode endpoint or run the local Anthropic bridge without bypassing provider limits.
 ---
 
-# OpenCode 429 — rotation WARP et proxies
+# Oplire: bridge and diagnostics
 
-## Quand utiliser ce skill
+## HTTP 429 and quotas
 
-- OpenCode renvoie **HTTP 429**, **« Free usage limit reached »** ou
-  **« Rate limit exceeded / Quota Exceeded »** ;
-- les requêtes échouent après un changement d'IP ou un redémarrage ;
-- `oplire status` indique `Disconnected`, ou `warp=off` dans le trace
-  Cloudflare.
+An HTTP 429 indicates a provider limit. Do not change the IP address, proxy,
+or WARP to evade it, and do not automatically replay the request. Honor
+`Retry-After` and the provider's terms. The Oplire bridge forwards the status
+and `Retry-After` header without replaying the request.
 
-## Commande recommandée
-
-```sh
-reset-opencode
-```
-
-Déroulé :
-
-1. `proxy-hunt` pour ajouter des proxies frais ;
-2. activation du mode proxy local si le pool est utilisable ;
-3. fermeture des processus OpenCode résiduels ;
-4. rotation vers un proxy frais, sinon `oplire reset` (WARP) ;
-5. vérification de l'IP et test d'une requête (3 essais en cas de 429).
-
-Variantes :
-
-| Commande | Effet |
-| --- | --- |
-| `reset-opencode --fast` | sans requête de test (après reboot) |
-| `reset-opencode --no-hunt` | ne pas rafraîchir le pool avant rotation |
-| `reset-opencode --proxy` | force le proxy suivant du pool |
-| `reset-opencode --default` | coupe WARP, connexion par défaut |
-
-## Pool de proxies
-
-Base SQLite : `$OPLIRE_STATE_DIR/proxies.db` (défaut `/root/proxies.db`,
-mode 600). Les proxies publics sont éphémères : rafraîchir souvent.
+## Bridge
 
 ```sh
-proxy-hunt --limit 400              # listes publiques → tests → import
-proxy-rotate list                   # état, fraîcheur, compteurs
-proxy-rotate test --all             # test réel via curl
-proxy-rotate refresh --jobs 40      # re-teste tout le pool
-proxy-rotate rotate                 # proxy suivant + applique
-proxy-rotate use 12                 # applique le proxy #12
-proxy-rotate 429                    # cooldown + rotation
-proxy-rotate 429 --warp             # fallback WARP si pool vide
-proxy-rotate ok | fail              # marque le résultat courant
-proxy-rotate status                 # résumé
-proxy-rotate prune                  # supprime les entrées mortes
+OPLIRE_UPSTREAM_URL=http://127.0.0.1:3000 oplire proxy
 ```
 
-## Mode automatique
+The bridge listens on `127.0.0.1:8080` by default. The Anthropic-compatible
+routes include `POST /v1/messages` and `GET /v1/models`.
+
+## Explicit diagnostics
 
 ```sh
-proxy-rotate auto on       # daemon 127.0.0.1:8899 + veilleur
-proxy-rotate auto status
-proxy-rotate auto off
+oplire check --url http://127.0.0.1:3000/health
+oplire models
 ```
 
-Le veilleur lit le log OpenCode, détecte les vrais 429, met le proxy en
-cooldown et bascule sur le suivant. Pool épuisé → `oplire reset`.
+Checks may retry bounded network or transient server errors, but stop
+immediately on HTTP 429.
 
-Service :
+## Proxy management
 
-```sh
-rc-service proxy-rotate status      # OpenRC
-systemctl status proxy-rotate       # systemd
-tail -f /var/log/proxy-rotate.log
-```
+The legacy `proxy-rotate` scripts support manual administration of authorized
+proxies. Do not use them to evade provider limits. `proxy-hunt` is disabled,
+and the watcher does not switch proxies on HTTP 429. Automatic changes are
+reserved for connectivity failures.
 
-## Revenir à la connexion par défaut
+## Legacy launcher
 
-```sh
-reset-opencode --default
-# ou
-reset-opencode-default [--dry-run] [--purge]
-```
-
-`--purge` sauvegarde puis supprime `wg0.conf` et les fichiers `wgcf`
-(`$OPLIRE_STATE_DIR/warp-backup-<date>.tar.gz`).
-
-## Diagnostic
-
-```sh
-oplire status
-curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)='
-proxy-rotate status
-proxy-rotate list --all
-curl -x http://127.0.0.1:8899 https://www.cloudflare.com/cdn-cgi/trace
-ip rule show
-wg show
-```
-
-| Symptôme | Piste |
-| --- | --- |
-| `warp=off` | tunnel down ou DNS : `reset-opencode` |
-| `429` en boucle | pool vide/mort : `proxy-hunt`, `refresh` |
-| IP inchangée | proxy transparent ou mort : `test --all` |
-| OpenCode ignore le proxy | vérifier `OPLIRE_ENV_FILE`, redémarrer OpenCode |
-| service KO | `rc-service proxy-rotate status`, log |
-
-## Installation du skill
-
-```sh
-install -Dm644 skills/oplire/SKILL.md \
-  "$HOME/.config/opencode/skills/oplire/SKILL.md"
-```
-
-Dépôt : <https://github.com/martinf08/oplire>
+`reset-opencode` is an OpenCode launcher alias. It does not reset networking or
+send a test generation. An explicit check is available with
+`reset-opencode --check URL`; any remaining arguments are passed to OpenCode.

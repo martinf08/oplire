@@ -1,200 +1,33 @@
 #!/bin/sh
-# ==============================================================================
-# Réinitialisation OpenCode + Cloudflare WARP (oplire)
-# Débloque les erreurs 429 / quota / rate-limit.
-#
-# Utilisation :
-#   reset-opencode          # reset + test OpenCode
-#   reset-opencode --fast   # reset seul, sans requête de test
-#   reset-opencode --default  # retour à la connexion par défaut (sans WARP)
-#   reset-opencode --proxy    # proxy suivant du pool (proxy-rotate)
-#   reset-opencode --no-hunt  # ne pas rafraîchir le pool avant rotation
-#
-# Fonctionne sur l'hôte Alpine (root ou utilisateur lab avec doas/sudo) et
-# dans la box Debian dev. Le script ne contient aucun secret.
-# ==============================================================================
+# Legacy-compatible launcher name. It does not reset networking, test a model,
+# retry requests, or change proxies when a provider reports HTTP 429.
+set -eu
 
-set -u
+case "${1-}" in
+    --fast|-f|--no-hunt|--default|-d|--proxy|-p)
+        echo "Legacy reset/rotation options are disabled; respect provider limits." >&2
+        exit 2
+        ;;
+esac
 
-FAST=0
-NO_HUNT=0
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --fast|-f)
-            FAST=1
-            shift
-            ;;
-        --no-hunt)
-            NO_HUNT=1
-            shift
-            ;;
-        --default|-d)
-            shift
-            exec /usr/local/bin/reset-opencode-default "$@"
-            ;;
-        --proxy|-p)
-            shift
-            exec /usr/local/bin/proxy-rotate rotate "$@"
-            ;;
-        *)
-            echo "Usage: reset-opencode [--fast|-f] [--no-hunt] [--default|-d] [--proxy|-p]" >&2
-            exit 2
-            ;;
-    esac
-done
+if [ "${1-}" = "--check" ]; then
+    [ "$#" -ge 2 ] || {
+        echo "Usage: reset-opencode [--check URL] [arguments OpenCode...]" >&2
+        exit 2
+    }
+    check_url=$2
+    shift 2
+    command -v oplire >/dev/null 2>&1 || {
+        echo "oplire was not found; install the binary to use --check." >&2
+        exit 127
+    }
+    oplire check --url "$check_url"
+    [ "$#" -gt 0 ] || exit 0
+fi
 
-say() {
-    printf '%s\n' "$*"
+command -v opencode >/dev/null 2>&1 || {
+    echo "opencode was not found in PATH." >&2
+    exit 127
 }
 
-# 0. Rafraîchir le pool (fraîcheur) puis activer le mode proxy.
-PROXY_MODE=0
-if [ "$NO_HUNT" -eq 0 ] && command -v proxy-hunt >/dev/null 2>&1; then
-    say "[1/5] Rafraîchissement du pool de proxies (fraîcheur)..."
-    proxy-hunt --limit "${PROXY_HUNT_LIMIT:-300}" --jobs "${PROXY_HUNT_JOBS:-80}" \
-        --timeout 5 2>&1 | sed 's/^/  /'
-fi
-if command -v proxy-rotate >/dev/null 2>&1; then
-    if proxy-rotate auto on >/dev/null 2>&1; then
-        PROXY_MODE=1
-    fi
-fi
-
-# 1. Démarrer la box dev si elle existe et n'est pas lancée.
-if [ -f /etc/alpine-release ] && command -v podman >/dev/null 2>&1; then
-    if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -qx dev; then
-        if [ "$(podman inspect -f '{{.State.Running}}' dev 2>/dev/null || true)" != "true" ]; then
-            say "  -> Démarrage de la box dev..."
-            podman start dev >/dev/null 2>&1 || \
-                say "  -> [AVERTISSEMENT] impossible de démarrer dev"
-        fi
-    fi
-fi
-
-say "=================================================="
-if [ "$PROXY_MODE" -eq 1 ]; then
-    say "  Réinitialisation OpenCode (mode proxy)"
-else
-    say "  Réinitialisation OpenCode & Cloudflare WARP"
-fi
-say "=================================================="
-
-# 2. Fermer les processus OpenCode résiduels.
-say "[2/5] Nettoyage des processus OpenCode résiduels..."
-if [ "${RESET_OPENCODE_NO_KILL:-0}" != "1" ]; then
-    pkill -9 -x opencode.orig 2>/dev/null || true
-    pkill -9 -x opencode 2>/dev/null || true
-fi
-
-if [ -f /etc/alpine-release ] && command -v podman >/dev/null 2>&1; then
-    podman exec dev pkill -9 -x opencode.orig 2>/dev/null || true
-    podman exec dev pkill -9 -x opencode 2>/dev/null || true
-fi
-
-# 3. Rotation : proxy si pool disponible, sinon WARP.
-if [ "$PROXY_MODE" -eq 1 ]; then
-    say "[3/5] Rotation du proxy (à chaud, sans redémarrage)..."
-    proxy-rotate rotate >/dev/null 2>&1 || true
-    proxy-rotate status 2>/dev/null | sed -n 's/^Actif  :/  -> /p'
-else
-    say "[3/5] Rotation de l'adresse IP via oplire reset..."
-    if [ -f /etc/alpine-release ]; then
-        if [ "$(id -u)" -eq 0 ]; then
-            /usr/bin/oplire reset
-        elif command -v doas >/dev/null 2>&1; then
-            doas /usr/bin/oplire reset
-        elif command -v sudo >/dev/null 2>&1; then
-            sudo /usr/bin/oplire reset
-        else
-            say "Erreur: oplire doit être lancé en root (doas/sudo absent)." >&2
-            exit 1
-        fi
-    elif [ -d /run/host ] && [ -x /run/host/usr/bin/oplire ]; then
-        if [ "$(id -u)" -eq 0 ]; then
-            chroot /run/host /usr/bin/oplire reset
-        else
-            say "Erreur: lancer le script depuis l'hôte, pas depuis la box dev." >&2
-            exit 1
-        fi
-    elif command -v oplire >/dev/null 2>&1; then
-        oplire reset
-    else
-        say "Erreur: binaire oplire introuvable." >&2
-        exit 1
-    fi
-fi
-
-# 4. Vérifier la connexion réelle.
-if [ "$PROXY_MODE" -eq 1 ]; then
-    say "[4/5] Vérification via le proxy local..."
-    if [ -f /etc/opencode-proxy.env ]; then
-        set -a
-        . /etc/opencode-proxy.env
-        set +a
-    fi
-    sleep 1
-    TRACE=$(curl -fsS --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-    NEW_IP=$(printf '%s\n' "$TRACE" | grep '^ip=' | cut -d= -f2)
-    if [ -n "$NEW_IP" ]; then
-        say "  -> Proxy OK — IP de sortie : $NEW_IP"
-    else
-        say "  -> [ERREUR] le proxy ne répond pas" >&2
-        exit 1
-    fi
-else
-    say "[4/5] Vérification de la connexion WARP..."
-    sleep 2
-
-    TRACE=$(curl -fsS --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-    NEW_IP=$(printf '%s\n' "$TRACE" | grep '^ip=' | cut -d= -f2)
-    WARP_STATE=$(printf '%s\n' "$TRACE" | grep '^warp=' | cut -d= -f2)
-
-    if [ "$WARP_STATE" = "on" ]; then
-        say "  -> Statut WARP : ACTIF"
-        say "  -> Nouvelle IP : $NEW_IP"
-    else
-        say "  -> [ERREUR] Tunnel WARP inactif (warp=${WARP_STATE:-inconnu})" >&2
-        exit 1
-    fi
-fi
-
-# 5. Test OpenCode, sauf en mode rapide.
-if [ "$FAST" -eq 1 ]; then
-    say "[5/5] Mode rapide : validation par requête ignorée (--fast)."
-elif command -v opencode >/dev/null 2>&1; then
-    say "[5/5] Test de validation OpenCode (deepseek-v4.1-flash-free)..."
-    ATTEMPT=1
-    while [ "$ATTEMPT" -le 3 ]; do
-        TEST_RES=$(opencode run "Réponds avec OK" \
-            --model opencode/deepseek-v4.1-flash-free 2>&1 || true)
-
-        if printf '%s\n' "$TEST_RES" | grep -qi 'OK'; then
-            say "  -> Succès : OpenCode a répondu (essai $ATTEMPT)."
-            break
-        fi
-
-        if printf '%s\n' "$TEST_RES" | grep -qiE 'limit|429|quota'; then
-            if [ "$PROXY_MODE" -eq 1 ] && [ "$ATTEMPT" -lt 3 ]; then
-                say "  -> 429 : rotation vers un autre proxy (essai $ATTEMPT)..."
-                proxy-rotate 429 >/dev/null 2>&1 || true
-                ATTEMPT=$((ATTEMPT + 1))
-                continue
-            fi
-            say "  -> [ERREUR] Toujours en rate-limit après $ATTEMPT essai(s)." >&2
-            exit 1
-        fi
-
-        say "  -> Résultat du test : $TEST_RES"
-        break
-    done
-else
-    say "[5/5] opencode introuvable : test ignoré."
-fi
-
-say "=================================================="
-if [ "$PROXY_MODE" -eq 1 ]; then
-    say "  Terminé : proxy actif (rotation à chaud)."
-else
-    say "  Terminé : WARP actif, IP changée."
-fi
-say "=================================================="
+exec opencode "$@"

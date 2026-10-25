@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 """
-proxy-rotate — pool de proxies + rotation automatique sur 429.
+proxy-rotate — manual management of authorized proxies and connectivity diagnostics.
 
-Deux modes :
+Two modes:
 
-  direct  l'env pointe directement sur un proxy du pool (changement = redémarrage)
-  local   l'env pointe sur un proxy local (127.0.0.1:8899) qui relaie vers le
-          proxy courant du pool. La rotation est alors *à chaud* : OpenCode
-          n'a pas besoin d'être redémarré.
+  direct  environment variables point directly to a pool proxy (restart to change)
+  local   environment variables point to a local proxy (127.0.0.1:8899), which
+          relays to the currently selected pool proxy. Changes apply live;
+          OpenCode does not need to restart.
 
-Le veilleur (`proxy-rotate watch`) lit les 429 dans les logs OpenCode et
-change de proxy automatiquement. Si le pool est vide/épuisé, il fait un
-`oplire reset` (rotation WARP) en secours.
+The watcher observes and reports HTTP 429 without switching proxies, replaying
+requests, or touching WARP. Proxy changes remain manual; automatic switching
+can only be triggered by a connectivity failure.
 
-Commandes :
-  init                         crée la base
-  add URL [options]            ajoute un proxy
-  import FICHIER               importe une liste (une URL par ligne)
-  list [--all] [--json]        liste les proxies
+Commands:
+  init                         initialize the database
+  add URL [options]            add a proxy
+  import FILE                  import a list (one URL per line)
+  list [--all] [--json]        list proxies
   remove ID | enable ID | disable ID
-  use ID                       applique ce proxy (mode direct)
-  rotate                       proxy suivant
-  429 [--warp]                 cooldown du proxy courant + rotation
+  use ID                       apply this proxy (direct mode)
+  rotate                       manually select the next proxy
+  429                          report a limit without switching proxies
   ok [ID] | fail [ID] | test [ID|--all]
-  auto [on|off|status]         mode automatique (daemon + veilleur)
-  start | stop | restart       gère daemon + veilleur
-  daemon | watch               internes (premier plan)
+  auto [on|off|status]         automatic mode (daemon + watcher)
+  start | stop | restart       manage daemon + watcher
+  daemon | watch               internal foreground commands
   status | reset | clear | export
 """
 
@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlsplit
 
 def _default_state_dir():
-    """Répertoire d'état : /root pour root, sinon XDG_DATA_HOME/oplire."""
+    """State directory: /root for root, otherwise XDG_DATA_HOME/oplire."""
     if os.geteuid() == 0:
         return "/root"
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(
@@ -60,7 +60,7 @@ def _default_state_dir():
 
 
 def _detect_lan():
-    """CIDR des réseaux locaux, pour ne pas les envoyer dans le proxy."""
+    """Local network CIDRs, which should not be routed through the proxy."""
     try:
         out = subprocess.run(
             ["ip", "-4", "route", "show", "scope", "link"],
@@ -92,19 +92,17 @@ LOCAL_URL = f"http://{LOCAL_HOST}:{LOCAL_PORT}"
 
 DEFAULT_COOLDOWN = 600
 DEFAULT_DEAD_AFTER = 3
-ROTATE_DEBOUNCE = 20          # s entre deux rotations automatiques
-WARP_DEBOUNCE = 120           # s entre deux resets WARP automatiques
+# Seconds between repeated quota notices in the log.
+RATE_NOTICE_DEBOUNCE = 20
 
 NO_PROXY_DEFAULT = os.environ.get(
     "OPLIRE_NO_PROXY",
     ",".join(["localhost", "127.0.0.1", "::1"] + _detect_lan()),
 )
 
-_last_warp = 0.0
-_watch_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------- utilitaires
+# ---------------------------------------------------------------- utilities
 
 def now():
     return datetime.now(timezone.utc).replace(microsecond=0)
@@ -122,14 +120,14 @@ def say(msg=""):
 
 
 def die(msg, code=1):
-    print(f"Erreur : {msg}", file=sys.stderr, flush=True)
+    print(f"Error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
 def connect(create=True):
     if not os.path.exists(DB_PATH):
         if not create:
-            die("base absente — lancer `proxy-rotate init`")
+            die("database not found; run `proxy-rotate init`")
         init_db()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -190,11 +188,10 @@ def init_db():
     conn.close()
     os.chmod(DB_PATH, 0o600)
     os.makedirs(RUN_DIR, exist_ok=True)
-    write_profile()
 
 
 def migrate(conn):
-    """Ajoute les colonnes récentes aux bases existantes."""
+    """Add recent columns to existing databases."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(proxies)")}
     if "last_seen" not in cols:
         conn.execute("ALTER TABLE proxies ADD COLUMN last_seen TEXT")
@@ -207,7 +204,7 @@ def write_profile():
     os.makedirs(os.path.dirname(PROFILE_FILE), exist_ok=True)
     with open(PROFILE_FILE, "w", encoding="utf-8") as fh:
         fh.write(
-            "# Chargé au login : proxy OpenCode (proxy-rotate)\n"
+            "# Loaded at login: OpenCode proxy (proxy-rotate)\n"
             f"[ -f {ENV_FILE} ] && set -a && . {ENV_FILE} && set +a\n"
         )
     os.chmod(PROFILE_FILE, 0o644)
@@ -255,11 +252,11 @@ def parse_proxy(value):
         raw = "http://" + raw
     parts = urlsplit(raw)
     if not parts.hostname:
-        raise ValueError(f"proxy invalide : {value}")
+        raise ValueError(f"invalid proxy URL: {value}")
     try:
         port = parts.port or (1080 if parts.scheme.startswith("socks") else 8080)
     except ValueError:
-        raise ValueError(f"port invalide : {value}")
+        raise ValueError(f"invalid port: {value}")
     return {
         "scheme": parts.scheme or "http",
         "host": parts.hostname,
@@ -269,7 +266,7 @@ def parse_proxy(value):
     }
 
 
-# ------------------------------------------------------------------ env/proxy
+# ------------------------------------------------------------- proxy environment
 
 def _write_env(url, comment):
     text = (
@@ -290,24 +287,24 @@ def _write_env(url, comment):
 
 
 def apply_direct(conn, row):
-    _write_env(proxy_url(row), f"Généré par proxy-rotate le {ts()} — proxy #{row['id']}")
+    _write_env(proxy_url(row), f"Generated by proxy-rotate on {ts()} — proxy #{row['id']}")
     conn.execute("UPDATE proxies SET last_used = ? WHERE id = ?", (ts(), row["id"]))
     set_setting(conn, "mode", "direct")
     set_setting(conn, "current_id", row["id"])
     log(conn, row["id"], "use", "direct")
     conn.commit()
-    say(f"Proxy actif : #{row['id']} {display_url(row)}")
-    say(f"Écrit dans {ENV_FILE}")
-    say("Redémarrer OpenCode pour l'appliquer :")
+    say(f"Active proxy: #{row['id']} {display_url(row)}")
+    say(f"Written to {ENV_FILE}")
+    say("Restart OpenCode to apply it:")
     say(f"  set -a; . {ENV_FILE}; set +a")
 
 
 def apply_local(conn):
-    _write_env(LOCAL_URL, f"Généré par proxy-rotate le {ts()} — mode local (daemon)")
+    _write_env(LOCAL_URL, f"Generated by proxy-rotate on {ts()} — local mode (daemon)")
     set_setting(conn, "mode", "local")
     conn.commit()
-    say(f"Mode local : OpenCode → {LOCAL_URL} → proxy courant")
-    say(f"Écrit dans {ENV_FILE}")
+    say(f"Local mode: OpenCode → {LOCAL_URL} → current proxy")
+    say(f"Written to {ENV_FILE}")
 
 
 def current_upstream_id(conn):
@@ -318,7 +315,7 @@ def current_upstream_id(conn):
 
 
 def _current_id(conn):
-    """Retrouve l'ID du proxy présent dans l'env appliqué (mode direct)."""
+    """Find the ID of the proxy in the applied environment (direct mode)."""
     if not os.path.exists(ENV_FILE):
         return None
     try:
@@ -357,7 +354,7 @@ def _eligible(conn, exclude=(), fresh_only=False):
 
 
 def _pick(conn, exclude=()):
-    """Proxy frais d'abord (last_seen récent), sinon n'importe quel actif."""
+    """Prefer recently seen proxies, otherwise select any active proxy."""
     rows = _eligible(conn, exclude, fresh_only=True)
     if not rows:
         rows = _eligible(conn, exclude)
@@ -377,11 +374,11 @@ def _cooldown(conn, row):
 def _get(conn, pid):
     row = conn.execute("SELECT * FROM proxies WHERE id = ?", (pid,)).fetchone()
     if not row:
-        die(f"proxy #{pid} introuvable")
+        die(f"proxy #{pid} not found")
     return row
 
 
-# --------------------------------------------------------------------- pid
+# --------------------------------------------------------------------- PID
 
 def _pid_path(name):
     return os.path.join(RUN_DIR, f"{name}.pid")
@@ -480,7 +477,7 @@ _up_cache = {"t": 0.0, "row": None}
 
 
 def _db_upstream():
-    """Proxy courant lu dans la base (cache 1 s)."""
+    """Read the current proxy from the database (1-second cache)."""
     t = time.time()
     if t - _up_cache["t"] < 1.0:
         return _up_cache["row"]
@@ -509,10 +506,10 @@ def _read_head(sock, limit=131072):
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(4096)
         if not chunk:
-            raise OSError("connexion fermée")
+            raise OSError("connection closed")
         data += chunk
         if len(data) > limit:
-            raise OSError("en-têtes trop volumineux")
+            raise OSError("headers too large")
     head, _, rest = data.partition(b"\r\n\r\n")
     return head + b"\r\n\r\n", rest
 
@@ -542,24 +539,24 @@ def _socks5(up, host, port):
         s.sendall(b"\x05\x02\x00\x02")
         if s.recv(2)[1] != 2:
             s.close()
-            raise OSError("socks5 : auth refusée")
+            raise OSError("SOCKS5 authentication method rejected")
         u = up["username"].encode()
         p = (up["password"] or "").encode()
         s.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
         if s.recv(2)[1] != 0:
             s.close()
-            raise OSError("socks5 : identifiants refusés")
+            raise OSError("SOCKS5 credentials rejected")
     else:
         s.sendall(b"\x05\x01\x00")
         if s.recv(2)[1] != 0:
             s.close()
-            raise OSError("socks5 : méthode refusée")
+            raise OSError("SOCKS5 method rejected")
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
               + port.to_bytes(2, "big"))
     resp = s.recv(10)
     if len(resp) < 2 or resp[1] != 0:
         s.close()
-        raise OSError(f"socks5 : erreur {resp[1] if len(resp) > 1 else '?'}")
+        raise OSError(f"SOCKS5 error {resp[1] if len(resp) > 1 else '?'}")
     return s
 
 
@@ -627,7 +624,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             _relay(client, upstream)
             return
 
-        # HTTP en clair (rare) : forward absolu vers l'amont ou direct.
+        # Plain HTTP (rare): forward absolute-form requests through the upstream or directly.
         up = _db_upstream()
         parts = urlsplit(target)
         host = parts.hostname
@@ -642,7 +639,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             return
         if up and not up["scheme"].startswith("socks"):
-            # proxy HTTP : requête en forme absolue, avec auth éventuelle
+            # HTTP proxy: absolute-form request, with optional authentication.
             lines = head.split(b"\r\n")
             if up["username"]:
                 cred = base64.b64encode(
@@ -651,7 +648,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 lines.insert(1, f"Proxy-Authorization: Basic {cred}".encode())
             upstream.sendall(b"\r\n".join(lines) + rest)
         else:
-            # direct : forme origine
+            # Direct connection: use origin-form requests.
             path = parts.path or "/"
             if parts.query:
                 path += "?" + parts.query
@@ -677,7 +674,7 @@ def cmd_daemon(args):
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    say(f"daemon proxy-rotate sur {LOCAL_HOST}:{LOCAL_PORT}")
+    say(f"proxy-rotate daemon listening on {LOCAL_HOST}:{LOCAL_PORT}")
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
@@ -688,7 +685,7 @@ def cmd_daemon(args):
             pass
 
 
-# -------------------------------------------------------------------- watch
+# ----------------------------------------------------------------- watcher
 
 RATE_RE = re.compile(
     r"(QuotaExceeded|Free usage limit|rate.?limit|HTTP[^\n]*\b429\b|\b429\b)",
@@ -697,7 +694,7 @@ RATE_RE = re.compile(
 
 
 def is_rate_line(line):
-    """Vrai uniquement pour une vraie ligne d'erreur OpenCode (pas une commande)."""
+    """Match a genuine OpenCode error line, not a command log entry."""
     if "spawning process" in line or "args=" in line or "message=\"event\"" in line:
         return False
     if "timestamp=" not in line:
@@ -705,57 +702,43 @@ def is_rate_line(line):
     return bool(RATE_RE.search(line))
 
 
-def _warp_reset():
-    global _last_warp
-    if time.time() - _last_warp < WARP_DEBOUNCE:
-        return False
-    _last_warp = time.time()
-    oplire = "/usr/bin/oplire" if os.path.exists("/usr/bin/oplire") else shutil.which("oplire")
-    if not oplire:
-        return False
-    try:
-        subprocess.Popen([oplire, "reset"], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-        return True
-    except OSError:
-        return False
+def is_rate_limit_reason(reason):
+    return bool(RATE_RE.search(reason) or "quota" in reason.lower())
 
 
 def auto_rotate(reason="429"):
-    """Cooldown du proxy courant + passage au suivant (à chaud si mode local)."""
+    """Switch only after a connectivity failure, never because of a quota."""
+    if is_rate_limit_reason(reason):
+        say("[auto] provider limit detected; no proxy switch or retry.")
+        return False
     conn = connect()
     cur = current_upstream_id(conn)
     if cur:
         row = _get(conn, cur)
         until = _cooldown(conn, row)
-        log(conn, cur, "429", f"{reason} — cooldown jusqu'à {until}")
+        log(conn, cur, "connectivity_failure", f"{reason} — cooldown until {until}")
         conn.commit()
-        say(f"[auto] #{cur} en cooldown jusqu'à {until} UTC")
+        say(f"[auto] #{cur} in cooldown until {until} UTC")
 
     nxt = _pick(conn, exclude=(cur,) if cur else ())
     if nxt is None:
-        nxt = _pick(conn)
-    if nxt is None:
-        say("[auto] pool épuisé → rotation WARP")
-        if _warp_reset():
-            log(conn, None, "warp", reason)
-            conn.commit()
+        say("[auto] no alternative proxy available; connection unchanged.")
         return False
 
     if get_setting(conn, "mode", "direct") == "local":
         set_setting(conn, "current_id", nxt["id"])
         conn.execute("UPDATE proxies SET last_used = ? WHERE id = ?", (ts(), nxt["id"]))
-        log(conn, nxt["id"], "rotate", f"{reason} (à chaud)")
+        log(conn, nxt["id"], "rotate", f"{reason} (live switch)")
         conn.commit()
-        say(f"[auto] → #{nxt['id']} {display_url(nxt)} (sans redémarrage)")
+        say(f"[auto] → #{nxt['id']} {display_url(nxt)} (no restart required)")
     else:
         apply_direct(conn, nxt)
-        say(f"[auto] → #{nxt['id']} {display_url(nxt)} (redémarrer OpenCode)")
+        say(f"[auto] → #{nxt['id']} {display_url(nxt)} (restart OpenCode)")
     return True
 
 
 def health_check():
-    """Vérifie que le proxy courant répond ; sinon le met en défaut et tourne."""
+    """Check the current proxy; mark it failed and switch only if unreachable."""
     conn = connect()
     if get_setting(conn, "mode", "direct") != "local":
         return
@@ -793,18 +776,18 @@ def health_check():
         conn.execute("UPDATE proxies SET fail_count = ? WHERE id = ?", (fails, pid))
         log(conn, pid, "fail", "health check")
     conn.commit()
-    say(f"[auto] proxy #{pid} injoignable → rotation")
-    auto_rotate("proxy injoignable")
+    say(f"[auto] proxy #{pid} is unreachable; checking for a connectivity fallback")
+    auto_rotate("proxy unreachable")
 
 
 def cmd_watch(args):
     os.makedirs(RUN_DIR, exist_ok=True)
-    # Un seul veilleur à la fois.
+    # Allow only one watcher at a time.
     lock_fh = open(os.path.join(RUN_DIR, "watch.lock"), "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        say("veilleur déjà actif — sortie.")
+        say("watcher is already running; exiting")
         return 0
     _write_pid("watch")
     ensure_daemon()
@@ -812,7 +795,7 @@ def cmd_watch(args):
     fh = None
     last = 0.0
     last_check = time.time()
-    say(f"watch proxy-rotate — log : {path}")
+    say(f"proxy-rotate watcher — log: {path}")
     while True:
         if fh is None:
             if not os.path.exists(path):
@@ -822,12 +805,9 @@ def cmd_watch(args):
             fh.seek(0, os.SEEK_END)
         line = fh.readline()
         if line:
-            if is_rate_line(line) and time.time() - last > ROTATE_DEBOUNCE:
+            if is_rate_line(line) and time.time() - last > RATE_NOTICE_DEBOUNCE:
                 last = time.time()
-                try:
-                    auto_rotate("429 détecté")
-                except Exception as exc:  # ne jamais mourir sur une erreur
-                    say(f"[auto] erreur : {exc}")
+                say("[limit] HTTP 429 detected; no proxy switch or retry. Honor Retry-After and provider terms.")
             continue
         try:
             if os.path.getsize(path) < fh.tell():
@@ -846,11 +826,11 @@ def cmd_watch(args):
         time.sleep(0.5)
 
 
-# ----------------------------------------------------------------- commandes
+# ----------------------------------------------------------------- commands
 
 def cmd_init(args):
     init_db()
-    say(f"Base prête : {DB_PATH}")
+    say(f"Database ready: {DB_PATH}")
 
 
 def cmd_add(args):
@@ -868,15 +848,15 @@ def cmd_add(args):
              p["password"], args.country, args.note, ts()),
         )
     except sqlite3.IntegrityError:
-        die("ce proxy existe déjà")
+        die("this proxy already exists")
     log(conn, cur.lastrowid, "add")
     conn.commit()
-    say(f"Ajouté #{cur.lastrowid} : {p['scheme']}://{p['host']}:{p['port']}")
+    say(f"Added #{cur.lastrowid}: {p['scheme']}://{p['host']}:{p['port']}")
 
 
 def cmd_import(args):
     if not os.path.exists(args.file):
-        die(f"fichier introuvable : {args.file}")
+        die(f"file not found: {args.file}")
     conn = connect()
     added = skipped = invalid = refreshed = 0
     with open(args.file, encoding="utf-8") as fh:
@@ -900,7 +880,7 @@ def cmd_import(args):
                 log(conn, cur.lastrowid, "add", "import")
                 added += 1
             except sqlite3.IntegrityError:
-                # Déjà en base : il vient de repasser le test, on rafraîchit.
+                # Already in the database: it passed again, so refresh its status.
                 conn.execute(
                     """UPDATE proxies SET last_seen = ?,
                        status = CASE WHEN status = 'dead' THEN 'active' ELSE status END
@@ -910,8 +890,8 @@ def cmd_import(args):
                 )
                 refreshed += 1
     conn.commit()
-    say(f"Import : {added} ajouté(s), {refreshed} rafraîchi(s), "
-        f"{skipped} doublon(s), {invalid} invalide(s)")
+    say(f"Import: {added} added, {refreshed} refreshed, "
+        f"{skipped} duplicates, {invalid} invalid")
 
 
 def cmd_list(args):
@@ -924,12 +904,12 @@ def cmd_list(args):
         say(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
         return
     if not rows:
-        say("Aucun proxy. Ajouter : proxy-rotate add http://user:pass@host:port")
+        say("No proxies. Add one with: proxy-rotate add http://user:pass@host:port")
         return
     cur = current_upstream_id(conn)
     ttl = int(get_setting(conn, "freshness_seconds", 1800))
     cutoff = ts(now() - timedelta(seconds=ttl))
-    say(f"   {'ID':>3}  {'ÉTAT':<8} {'PAYS':<5} {'VU':<16} {'OK':>3} {'KO':>3}  URL")
+    say(f"   {'ID':>3}  {'STATUS':<8} {'COUNTRY':<7} {'SEEN':<16} {'OK':>3} {'FAIL':>4}  URL")
     for r in rows:
         if r["id"] == cur:
             mark = "*"
@@ -937,9 +917,9 @@ def cmd_list(args):
             mark = " "
         else:
             mark = "!"
-        vu = (r["last_seen"] or "-")[5:16]
+        seen = (r["last_seen"] or "-")[5:16]
         say(f"{mark}  {r['id']:>3}  {r['status']:<8} {(r['country'] or '-'):<5} "
-            f"{vu:<16} {r['ok_count']:>3} {r['fail_count']:>3}  {display_url(r)}")
+            f"{seen:<16} {r['ok_count']:>3} {r['fail_count']:>3}  {display_url(r)}")
 
 
 def cmd_remove(args):
@@ -949,7 +929,7 @@ def cmd_remove(args):
     if str(get_setting(conn, "current_id", "")) == str(args.id):
         set_setting(conn, "current_id", "")
     conn.commit()
-    say(f"Supprimé #{args.id}")
+    say(f"Removed #{args.id}")
 
 
 def _set_status(args, status):
@@ -973,31 +953,27 @@ def cmd_use(args):
     conn = connect()
     row = _get(conn, args.id)
     if row["status"] != "active":
-        die(f"proxy #{args.id} n'est pas actif ({row['status']})")
+        die(f"proxy #{args.id} is not active ({row['status']})")
     apply_direct(conn, row)
 
 
 def cmd_rotate(args):
+    if args.reason and is_rate_limit_reason(args.reason):
+        say("Refusing: HTTP 429/quota must never trigger a proxy switch.")
+        return 2
     conn = connect()
     cur = current_upstream_id(conn)
     row = _pick(conn, exclude=(cur,) if cur else ())
     if row is None:
-        row = _pick(conn)
-    if row is None:
-        say("Aucun proxy disponible.")
-        if args.warp:
-            say("Fallback : rotation WARP...")
-            _warp_reset()
-        else:
-            say("Ajouter un proxy ou utiliser `proxy-rotate 429 --warp`.")
+        say("No different proxy is available; network settings were not changed.")
         return 1
     if get_setting(conn, "mode", "direct") == "local":
         ensure_daemon()
         set_setting(conn, "current_id", row["id"])
         conn.execute("UPDATE proxies SET last_used = ? WHERE id = ?", (ts(), row["id"]))
-        log(conn, row["id"], "rotate", args.reason or "manuel (à chaud)")
+        log(conn, row["id"], "rotate", args.reason or "manual (live switch)")
         conn.commit()
-        say(f"Proxy actif : #{row['id']} {display_url(row)} (rotation à chaud)")
+        say(f"Active proxy: #{row['id']} {display_url(row)} (live switch)")
     else:
         if args.reason:
             log(conn, row["id"], "rotate", args.reason)
@@ -1006,24 +982,16 @@ def cmd_rotate(args):
 
 
 def cmd_429(args):
-    conn = connect()
-    cur = current_upstream_id(conn)
-    if cur:
-        row = _get(conn, cur)
-        until = _cooldown(conn, row)
-        log(conn, cur, "429", f"cooldown jusqu'à {until}")
-        conn.commit()
-        say(f"#{cur} marqué 429 (cooldown jusqu'à {until} UTC)")
-    else:
-        say("Aucun proxy actif détecté — rotation directe.")
-    return cmd_rotate(argparse.Namespace(reason="429", warp=args.warp))
+    say("HTTP 429/quota detected: no proxy switch, WARP reset, or retry.")
+    say("Honor Retry-After and provider limits; the original request remains the only attempt.")
+    return 0
 
 
 def cmd_ok(args):
     conn = connect()
     pid = args.id or current_upstream_id(conn)
     if not pid:
-        die("aucun proxy courant — préciser un ID")
+        die("no current proxy; specify an ID")
     _get(conn, pid)
     conn.execute(
         """UPDATE proxies SET status = 'active', ok_count = ok_count + 1,
@@ -1040,7 +1008,7 @@ def cmd_fail(args):
     conn = connect()
     pid = args.id or current_upstream_id(conn)
     if not pid:
-        die("aucun proxy courant — préciser un ID")
+        die("no current proxy; specify an ID")
     row = _get(conn, pid)
     dead_after = int(get_setting(conn, "dead_after", DEFAULT_DEAD_AFTER))
     fails = row["fail_count"] + 1
@@ -1049,19 +1017,19 @@ def cmd_fail(args):
             "UPDATE proxies SET status = 'dead', fail_count = ? WHERE id = ?",
             (fails, pid),
         )
-        log(conn, pid, "dead", f"{fails} échecs")
-        say(f"#{pid} → dead ({fails} échecs)")
+        log(conn, pid, "dead", f"{fails} failures")
+        say(f"#{pid} → dead ({fails} failures)")
     else:
         until = _cooldown(conn, row)
         conn.execute("UPDATE proxies SET fail_count = ? WHERE id = ?", (fails, pid))
-        log(conn, pid, "fail", f"échec {fails}")
-        say(f"#{pid} → cooldown jusqu'à {until} UTC ({fails} échec(s))")
+        log(conn, pid, "fail", f"failure {fails}")
+        say(f"#{pid} → cooldown until {until} UTC ({fails} failure(s))")
     conn.commit()
 
 
 def cmd_test(args):
     if not shutil.which("curl"):
-        die("curl requis pour tester les proxies")
+        die("curl is required to test proxies")
     conn = connect()
     if args.all:
         rows = conn.execute("SELECT * FROM proxies ORDER BY id").fetchall()
@@ -1070,7 +1038,7 @@ def cmd_test(args):
     else:
         pid = current_upstream_id(conn)
         if not pid:
-            die("aucun proxy courant — préciser un ID ou --all")
+            die("no current proxy; specify an ID or --all")
         rows = [_get(conn, pid)]
 
     for row in rows:
@@ -1113,8 +1081,8 @@ def cmd_test(args):
                     "UPDATE proxies SET fail_count = ? WHERE id = ?", (fails, row["id"])
                 )
                 state = f"cooldown → {until}"
-            log(conn, row["id"], "test", f"échec {code}")
-            say(f"#{row['id']:<3} KO   {code}  {elapsed:5.2f}s  {state}  {display_url(row)}")
+            log(conn, row["id"], "test", f"failure {code}")
+            say(f"#{row['id']:<3} FAIL {code}  {elapsed:5.2f}s  {state}  {display_url(row)}")
         conn.commit()
     return 0
 
@@ -1133,11 +1101,11 @@ def _curl_test(url, timeout):
 
 
 def cmd_refresh(args):
-    """Re-teste tous les proxies en parallèle et met à jour la fraîcheur."""
+    """Retest all proxies in parallel and update their freshness."""
     conn = connect()
     rows = conn.execute("SELECT * FROM proxies WHERE status != 'disabled'").fetchall()
     if not rows:
-        say("Aucun proxy à rafraîchir.")
+        say("No proxies to refresh.")
         return 0
 
     results = {}
@@ -1146,7 +1114,7 @@ def cmd_refresh(args):
         for fut in as_completed(futures):
             results[futures[fut]] = fut.result()
 
-    ok = ko = 0
+    ok = failed = 0
     dead_after = int(get_setting(conn, "dead_after", DEFAULT_DEAD_AFTER))
     for r in rows:
         if results.get(r["id"]):
@@ -1158,7 +1126,7 @@ def cmd_refresh(args):
                 (ts(), ts(), r["id"]),
             )
         else:
-            ko += 1
+            failed += 1
             fails = r["fail_count"] + 1
             if fails >= dead_after:
                 conn.execute(
@@ -1170,9 +1138,9 @@ def cmd_refresh(args):
                 conn.execute(
                     "UPDATE proxies SET fail_count = ? WHERE id = ?", (fails, r["id"])
                 )
-    log(conn, None, "refresh", f"{ok} ok / {ko} ko")
+    log(conn, None, "refresh", f"{ok} passed / {failed} failed")
     conn.commit()
-    say(f"Refresh : {ok} OK, {ko} KO ({len(rows)} testés)")
+    say(f"Refresh: {ok} passed, {failed} failed ({len(rows)} tested)")
     return 0
 
 
@@ -1183,7 +1151,7 @@ def cmd_auto(args):
     if action == "on":
         first = _pick(conn)
         if first is None:
-            say("Aucun proxy actif — mode automatique non activé.")
+            say("No active proxy; automatic mode was not enabled.")
             return 1
         cur = current_upstream_id(conn)
         if not cur:
@@ -1194,8 +1162,8 @@ def cmd_auto(args):
         conn.commit()
         ensure_daemon()
         ensure_watch()
-        say("Mode automatique actif (daemon + veilleur 429).")
-        say("Relancer OpenCode pour qu'il utilise le proxy local :")
+        say("Automatic mode enabled (daemon + limit/connectivity watcher).")
+        say("Restart OpenCode to use the local proxy:")
         say(f"  set -a; . {ENV_FILE}; set +a")
         return 0
 
@@ -1208,21 +1176,21 @@ def cmd_auto(args):
             os.remove(ENV_FILE)
         except OSError:
             pass
-        say("Mode automatique désactivé (connexion directe/WARP).")
+        say("Automatic mode disabled (direct connection; WARP was not changed).")
         return 0
 
     # status
     mode = get_setting(conn, "mode", "direct")
     say(f"Mode      : {mode}")
-    say(f"Daemon    : {'actif' if _port_open() else 'arrêté'} ({LOCAL_URL})")
-    say(f"Veilleur  : {'actif' if _alive(_read_pid('watch')) else 'arrêté'}")
+    say(f"Daemon    : {'running' if _port_open() else 'stopped'} ({LOCAL_URL})")
+    say(f"Watcher   : {'running' if _alive(_read_pid('watch')) else 'stopped'}")
     pid = current_upstream_id(conn)
     if pid:
-        say(f"Courant   : #{pid} {display_url(_get(conn, pid))}")
+        say(f"Current   : #{pid} {display_url(_get(conn, pid))}")
     else:
-        say("Courant   : aucun")
+        say("Current   : none")
     if mode == "local":
-        say(f"Env       : {ENV_FILE} → {LOCAL_URL}")
+        say(f"Environment: {ENV_FILE} → {LOCAL_URL}")
     return 0
 
 
@@ -1230,15 +1198,15 @@ def cmd_start(args):
     conn = connect()
     ensure_daemon()
     ensure_watch()
-    say("Daemon + veilleur démarrés.")
+    say("Daemon and watcher started.")
     if get_setting(conn, "mode", "direct") == "local":
-        say(f"OpenCode doit pointer sur {LOCAL_URL} (env : {ENV_FILE}).")
+        say(f"OpenCode must point to {LOCAL_URL} (environment file: {ENV_FILE}).")
 
 
 def cmd_stop(args):
     _stop_pid("watch")
     _stop_pid("daemon")
-    say("Daemon + veilleur arrêtés.")
+    say("Daemon and watcher stopped.")
 
 
 def cmd_status(args):
@@ -1247,7 +1215,7 @@ def cmd_status(args):
         "SELECT status, COUNT(*) n FROM proxies GROUP BY status ORDER BY status"
     ).fetchall()
     total = sum(r["n"] for r in counts)
-    say(f"Base   : {DB_PATH} — {total} proxy(ies)")
+    say(f"Database: {DB_PATH} — {total} proxy/proxies")
     for r in counts:
         say(f"  {r['status']:<9} {r['n']:>3}")
     ttl = int(get_setting(conn, "freshness_seconds", 1800))
@@ -1256,17 +1224,17 @@ def cmd_status(args):
            AND last_seen IS NOT NULL AND last_seen >= ?""",
         (ts(now() - timedelta(seconds=ttl)),),
     ).fetchone()["n"]
-    say(f"  frais     {fresh:>3}  (validés < {ttl // 60} min)")
-    say(f"Mode   : {get_setting(conn, 'mode', 'direct')}")
-    say(f"Daemon : {'actif' if _port_open() else 'arrêté'} — "
-        f"veilleur {'actif' if _alive(_read_pid('watch')) else 'arrêté'}")
+    say(f"  fresh     {fresh:>3}  (checked < {ttl // 60} min ago)")
+    say(f"Mode     : {get_setting(conn, 'mode', 'direct')}")
+    say(f"Daemon   : {'running' if _port_open() else 'stopped'} — "
+        f"watcher {'running' if _alive(_read_pid('watch')) else 'stopped'}")
     pid = current_upstream_id(conn)
     if pid:
-        say(f"Actif  : #{pid} {display_url(_get(conn, pid))}")
+        say(f"Active   : #{pid} {display_url(_get(conn, pid))}")
     else:
-        say("Actif  : aucun (connexion directe / WARP)")
+        say("Active   : no proxy managed by Oplire")
     say(f"Cooldown : {get_setting(conn, 'cooldown_seconds', DEFAULT_COOLDOWN)}s — "
-        f"dead après {get_setting(conn, 'dead_after', DEFAULT_DEAD_AFTER)} échecs")
+        f"mark dead after {get_setting(conn, 'dead_after', DEFAULT_DEAD_AFTER)} failures")
 
 
 def cmd_reset(args):
@@ -1275,16 +1243,16 @@ def cmd_reset(args):
         """UPDATE proxies SET status = 'active', fail_count = 0,
            cooldown_until = NULL WHERE status IN ('cooldown', 'dead')"""
     )
-    log(conn, None, "reset", "cooldowns et compteurs remis à zéro")
+    log(conn, None, "reset", "cooldowns and counters cleared")
     conn.commit()
-    say("Cooldowns et compteurs remis à zéro.")
+    say("Cooldowns and counters cleared.")
 
 
 def cmd_prune(args):
     conn = connect()
     n = conn.execute("DELETE FROM proxies WHERE status = 'dead'").rowcount
     conn.commit()
-    say(f"{n} proxy(ies) mort(s) supprimé(s).")
+    say(f"Removed {n} dead proxy/proxies.")
 
 
 def cmd_clear(args):
@@ -1298,7 +1266,7 @@ def cmd_clear(args):
         set_setting(conn, "mode", "direct")
         log(conn, None, "clear")
         conn.commit()
-    say("Proxy retiré de l'environnement." if removed else "Aucun proxy appliqué.")
+    say("Proxy removed from the environment." if removed else "No proxy is currently applied.")
 
 
 def cmd_export(args):
@@ -1318,88 +1286,86 @@ def cmd_export(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="proxy-rotate",
-        description="Pool de proxies + rotation automatique sur 429.",
+        description="Manual management of authorized proxies; no rotation on HTTP 429/quota.",
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("init", help="crée la base").set_defaults(func=cmd_init)
+    sub.add_parser("init", help="initialize the database").set_defaults(func=cmd_init)
 
-    p = sub.add_parser("add", help="ajoute un proxy")
-    p.add_argument("url", help="host:port ou http://user:pass@host:port")
+    p = sub.add_parser("add", help="add a proxy")
+    p.add_argument("url", help="host:port or http://user:pass@host:port")
     p.add_argument("--label")
     p.add_argument("--country")
     p.add_argument("--note")
     p.set_defaults(func=cmd_add)
 
-    p = sub.add_parser("import", help="importe une liste (une URL par ligne)")
+    p = sub.add_parser("import", help="import a list (one URL per line)")
     p.add_argument("file")
     p.add_argument("--source", default="import")
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("list", help="liste les proxies")
+    p = sub.add_parser("list", help="list proxies")
     p.add_argument("--all", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("remove", help="supprime un proxy")
+    p = sub.add_parser("remove", help="remove a proxy")
     p.add_argument("id", type=int)
     p.set_defaults(func=cmd_remove)
 
-    p = sub.add_parser("enable", help="active un proxy")
+    p = sub.add_parser("enable", help="enable a proxy")
     p.add_argument("id", type=int)
     p.set_defaults(func=cmd_enable)
 
-    p = sub.add_parser("disable", help="désactive un proxy")
+    p = sub.add_parser("disable", help="disable a proxy")
     p.add_argument("id", type=int)
     p.set_defaults(func=cmd_disable)
 
-    p = sub.add_parser("use", help="applique un proxy (mode direct)")
+    p = sub.add_parser("use", help="apply a proxy (direct mode)")
     p.add_argument("id", type=int)
     p.set_defaults(func=cmd_use)
 
-    p = sub.add_parser("rotate", help="passe au proxy suivant")
+    p = sub.add_parser("rotate", help="manually select the next proxy")
     p.add_argument("--reason")
-    p.add_argument("--warp", action="store_true", help="reset WARP si pool vide")
     p.set_defaults(func=cmd_rotate)
 
-    p = sub.add_parser("429", help="cooldown du proxy courant + rotation")
-    p.add_argument("--warp", action="store_true", help="reset WARP si pool vide")
+    p = sub.add_parser("429", help="report a provider limit without switching proxies")
     p.set_defaults(func=cmd_429)
 
-    p = sub.add_parser("ok", help="marque un succès")
+    p = sub.add_parser("ok", help="mark a successful proxy")
     p.add_argument("id", type=int, nargs="?")
     p.set_defaults(func=cmd_ok)
 
-    p = sub.add_parser("fail", help="marque un échec")
+    p = sub.add_parser("fail", help="mark a failed proxy")
     p.add_argument("id", type=int, nargs="?")
     p.set_defaults(func=cmd_fail)
 
-    p = sub.add_parser("test", help="teste un ou tous les proxies")
+    p = sub.add_parser("test", help="test one or all proxies")
     p.add_argument("id", type=int, nargs="?")
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_test)
 
-    p = sub.add_parser("refresh", help="re-teste tous les proxies (parallèle)")
+    p = sub.add_parser("refresh", help="retest all proxies in parallel")
     p.add_argument("--jobs", type=int, default=20)
     p.add_argument("--timeout", type=int, default=8)
     p.set_defaults(func=cmd_refresh)
 
-    p = sub.add_parser("auto", help="mode automatique (daemon + veilleur)")
+    p = sub.add_parser("auto", help="automatic mode (daemon + watcher)")
     p.add_argument("action", nargs="?", choices=["on", "off", "status"])
     p.set_defaults(func=cmd_auto)
 
-    sub.add_parser("start", help="démarre daemon + veilleur").set_defaults(func=cmd_start)
-    sub.add_parser("stop", help="arrête daemon + veilleur").set_defaults(func=cmd_stop)
+    sub.add_parser("start", help="start daemon + watcher").set_defaults(func=cmd_start)
+    sub.add_parser("stop", help="stop daemon + watcher").set_defaults(func=cmd_stop)
 
-    sub.add_parser("daemon", help="proxy local (premier plan)").set_defaults(func=cmd_daemon)
-    sub.add_parser("watch", help="veilleur 429 (premier plan)").set_defaults(func=cmd_watch)
+    sub.add_parser("daemon", help="run the local proxy in the foreground").set_defaults(func=cmd_daemon)
+    sub.add_parser("watch", help="watch limits and connectivity without switching on quota").set_defaults(func=cmd_watch)
 
-    sub.add_parser("status", help="état courant").set_defaults(func=cmd_status)
-    sub.add_parser("reset", help="remet cooldowns/compteurs à zéro").set_defaults(func=cmd_reset)
-    sub.add_parser("prune", help="supprime les proxies morts").set_defaults(func=cmd_prune)
-    sub.add_parser("clear", help="retire le proxy").set_defaults(func=cmd_clear)
+    sub.add_parser("status", help="show current status").set_defaults(func=cmd_status)
+    sub.add_parser("reset", help="clear cooldowns and counters").set_defaults(func=cmd_reset)
+    sub.add_parser("prune", help="remove dead proxies").set_defaults(func=cmd_prune)
+    sub.add_parser("clear", help="remove the configured proxy").set_defaults(func=cmd_clear)
 
-    p = sub.add_parser("export", help="exporte les proxies actifs")
+    p = sub.add_parser("export", help="export active proxies")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_export)
 

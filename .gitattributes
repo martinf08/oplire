@@ -1,0 +1,15 @@
+* text=auto
+
+.gitattributes text eol=lf
+*.md text eol=lf
+.gitignore text eol=lf
+*.lock text eol=lf
+LICENSE text eol=lf
+*.py text eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+*.service text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+bin/* text eol=lf
+init.d/* text eol=lf

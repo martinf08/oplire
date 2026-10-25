@@ -1,9 +1,9 @@
 #!/sbin/openrc-run
-# Rotation automatique des proxies OpenCode sur 429.
-# Le veilleur démarre aussi le proxy local (127.0.0.1:8899) si besoin.
+# Connectivity watcher; HTTP 429 is reported without switching proxies.
+# The watcher also starts the local proxy (127.0.0.1:8899) when needed.
 
 name="proxy-rotate"
-description="Rotation automatique de proxies OpenCode sur 429"
+description="Connectivity watcher for configured Oplire proxies"
 
 command="/usr/local/bin/proxy-rotate"
 command_args="watch"
