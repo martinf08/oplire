@@ -212,9 +212,12 @@ cargo build --release --bins --locked
 ```
 
 The tests use temporary databases and local fixtures; they do not use real
-proxies or change host networking. CI checks formatting, lint, tests, and release
-builds. A version tag builds target-specific archives and publishes them with
-SHA-256 checksums.
+proxies or change host networking. CI checks formatting, lint and tests on Linux
+for PRs and `main`, with a Cargo cache; documentation-only changes are skipped.
+The five-platform test/build matrix runs only for version tags or a manual
+request. A version tag publishes archives with SHA-256 checksums. Individual
+executable downloads are retained for older installers; users normally need
+only the single complete archive matching their platform.
 
 ## License and attribution
 

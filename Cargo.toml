@@ -1,6 +1,6 @@
 [package]
 name = "oplire"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Local API bridge, endpoint diagnostics, and authorized proxy management"
 authors = ["martinf08", "Berke Oruc (adapted components)"]
