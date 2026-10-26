@@ -1,8 +1,12 @@
-__pycache__/
-target/
-*.pyc
+/target/
+/dist/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.log
 *.tar.gz
+*.zip
 .env
+.env.*
+!.env.example

@@ -13,6 +13,7 @@ pub fn build_client(egress_proxy: Option<&str>) -> anyhow::Result<reqwest::Clien
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
+        .redirect(reqwest::redirect::Policy::none())
         // Do not silently inherit HTTP_PROXY/HTTPS_PROXY from the host. Egress
         // is direct unless OPLIRE_EGRESS_PROXY (or --egress-proxy) is explicit.
         .no_proxy();
@@ -24,7 +25,7 @@ pub fn build_client(egress_proxy: Option<&str>) -> anyhow::Result<reqwest::Clien
         anyhow::ensure!(
             matches!(parsed.scheme(), "http" | "https" | "socks5")
                 && parsed.host_str().is_some()
-                && parsed.path() == "/"
+                && matches!(parsed.path(), "" | "/")
                 && parsed.query().is_none()
                 && parsed.fragment().is_none(),
             "invalid egress proxy URL; use an HTTP(S) or SOCKS5 URL with no path, query, or fragment"
@@ -93,6 +94,11 @@ mod tests {
         assert!(build_client(Some("ftp://proxy.example:21")).is_err());
         assert!(build_client(Some("http://proxy.example:8080/path")).is_err());
         assert!(build_client(Some("not a URL")).is_err());
+    }
+
+    #[test]
+    fn accepts_local_socks5_proxy_without_a_trailing_slash() {
+        assert!(build_client(Some("socks5://127.0.0.1:1080")).is_ok());
     }
 
     #[tokio::test]

@@ -41,6 +41,49 @@ Linux/macOS prefix is `/usr/local`; Windows installs to
 `%LOCALAPPDATA%\Programs\Oplire\bin`. On Windows, run the binaries from that
 folder or add it to your user `PATH`.
 
+## Installation with an AI assistant
+
+An AI coding assistant can guide or perform the setup. Ask it to use only the
+official [GitHub Releases](https://github.com/martinf08/oplire/releases), detect
+the machine's OS and architecture, verify the downloaded archive against the
+release's `SHA256SUMS`, and prefer a user-writable prefix. It should ask before
+using administrator privileges or enabling a system service, and must not
+change WARP, proxy, or system network settings as part of installation.
+
+Copy this prompt into your assistant:
+
+> Install Oplire from https://github.com/martinf08/oplire. Read its README,
+> detect my OS/architecture and libc on Linux, download the matching latest
+> official release archive and SHA256SUMS, and verify its checksum before
+> executing it. Prefer a user-writable installation prefix; ask before using
+> administrator privileges or changing PATH. Verify the installed version and
+> CLI help. Do not enable a service, change networking, or run model generations
+> without my approval. Never change a proxy or WARP to respond to HTTP 429.
+
+From an extracted release archive, the assistant can use one of these commands:
+
+```sh
+# Linux/macOS: install for the current user without administrator privileges.
+./bin/oplire install --latest --prefix "$HOME/.local"
+
+# Linux/macOS: system-wide installation (requires administrator privileges).
+sudo ./bin/oplire install --latest
+```
+
+On Windows, run `.\bin\oplire.exe install --latest` in PowerShell; the default
+destination is `%LOCALAPPDATA%\Programs\Oplire\bin`. Add that directory to the
+user `PATH` if desired. Then verify with:
+
+```powershell
+oplire --version
+oplire proxy --help
+```
+
+The published Linux binaries target GNU/glibc, not musl. Alpine/musl has no
+prebuilt target or OpenRC service in this release; an assistant should report
+that limitation rather than install a potentially incompatible binary. The
+optional boot service is systemd-only and should be enabled only when requested.
+
 ## Binaries
 
 - **`oplire`** — API bridge, health checks, model listing, and release installer.
@@ -48,7 +91,7 @@ folder or add it to your user `PATH`.
   forwarder/observer. Proxy changes are only explicit or in response to a
   connectivity failure; never a rate limit.
 - **`proxy-hunt`** — intentionally disabled; it does not collect public proxy
-  lists.
+  lists. Retained only as a compatibility notice, not a required background tool.
 - **`reset-opencode`** — compatibility launcher for OpenCode. It does not
   perform a test generation or alter network settings.
 - **`reset-opencode-default`** — separate Linux network-administration utility
@@ -67,6 +110,9 @@ The upstream must expose an OpenAI-compatible API, including
 translates text-only Anthropic `POST /v1/messages` requests. It supports JSON
 responses, server-sent event streams, model-list endpoints, and `GET /health`.
 Images and tool use are rejected explicitly rather than silently discarded.
+`oplire models` prints a bundled example catalogue; it does not guarantee that
+those models are available or free on your upstream. HTTP model-list endpoints
+query the upstream; price and context metadata are included only when supplied.
 
 ```sh
 OPLIRE_UPSTREAM_URL=http://127.0.0.1:3000 \
@@ -171,6 +217,10 @@ builds. A version tag builds target-specific archives and publishes them with
 SHA-256 checksums.
 
 ## License and attribution
+
+For development checks and compatibility expectations, see
+[CONTRIBUTING.md](CONTRIBUTING.md). See [SECURITY.md](SECURITY.md) for the security
+boundary and vulnerability-reporting guidance.
 
 Oplire is distributed under the MIT License. The Anthropic API transformation
 and portions of the bridge structure are adapted from `BerkeOruc/oplire`; see

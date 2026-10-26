@@ -1,6 +1,9 @@
+#[cfg(target_os = "linux")]
 use anyhow::{bail, Context, Result};
+#[cfg(target_os = "linux")]
 use chrono::Utc;
 use clap::Parser;
+#[cfg(target_os = "linux")]
 use std::{
     env, fs,
     path::{Path, PathBuf},
