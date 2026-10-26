@@ -33,10 +33,10 @@ immediately on HTTP 429.
 
 ## Proxy management
 
-The legacy `proxy-rotate` scripts support manual administration of authorized
-proxies. Do not use them to evade provider limits. `proxy-hunt` is disabled,
-and the watcher does not switch proxies on HTTP 429. Automatic changes are
-reserved for connectivity failures.
+The `proxy-rotate` Rust binary supports manual administration of authorized
+proxies. Do not use it to evade provider limits. `proxy-hunt` is disabled, and
+the watcher does not switch proxies on HTTP 429. Automatic changes are reserved
+for connectivity failures.
 
 ## Legacy launcher
 
