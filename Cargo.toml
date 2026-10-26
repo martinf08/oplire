@@ -1,6 +1,6 @@
 [package]
 name = "oplire"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "A small API bridge and OpenCode health-check launcher"
 authors = ["martinf08", "Berke Oruc (adapted components)"]

@@ -3,11 +3,12 @@ use clap::{Parser, Subcommand};
 use oplire::{config::ProxyConfig, health::check_url, proxy::start_proxy_server};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
 };
 use tracing_subscriber::EnvFilter;
 
@@ -141,11 +142,13 @@ async fn install_release(
         anyhow::bail!("--with-service is supported only on Linux with systemd");
     }
 
-    #[cfg(unix)]
-    if !dry_run {
+    #[cfg(target_os = "linux")]
+    if with_service && !dry_run {
         let identity = ProcessCommand::new("id").arg("-u").output()?;
         if String::from_utf8_lossy(&identity.stdout).trim() != "0" {
-            anyhow::bail!("installing under this prefix requires root; rerun with sudo/doas or select a writable prefix");
+            anyhow::bail!(
+                "--with-service writes to /etc/systemd and requires root; rerun with sudo/doas"
+            );
         }
     }
 
@@ -163,10 +166,15 @@ async fn install_release(
         } else {
             // Download and verify all files before making any installation changes.
             let binaries = download_latest_binaries().await?;
-            fs::create_dir_all(&bin_dir)?;
+            create_install_bin_dir(&bin_dir)?;
             for (name, bytes) in binaries {
                 let destination = bin_dir.join(name);
-                write_installed_binary(&destination, &bytes)?;
+                write_installed_binary(&destination, &bytes).with_context(|| {
+                    format!(
+                        "cannot install {}; use sudo or choose a writable --prefix",
+                        destination.display()
+                    )
+                })?;
                 println!("Installed {}", destination.display());
             }
         }
@@ -196,10 +204,15 @@ async fn install_release(
                 println!("[dry-run] install {name} into {}", bin_dir.display());
             }
         } else {
-            fs::create_dir_all(&bin_dir)?;
+            create_install_bin_dir(&bin_dir)?;
             for (name, source) in &sources {
                 let destination = bin_dir.join(format!("{name}{extension}"));
-                fs::copy(source, &destination)?;
+                fs::copy(source, &destination).with_context(|| {
+                    format!(
+                        "cannot install {}; use sudo or choose a writable --prefix",
+                        destination.display()
+                    )
+                })?;
                 set_executable_permissions(&destination)?;
                 println!("Installed {}", destination.display());
             }
@@ -319,21 +332,21 @@ async fn download_latest_binaries() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         .collect::<HashMap<_, _>>();
 
     let mut binaries = Vec::with_capacity(asset_names.len());
-    for name in asset_names {
+    for (program, asset_name) in programs.iter().zip(asset_names) {
         let asset = release
             .assets
             .iter()
-            .find(|asset| asset.name == name)
-            .with_context(|| format!("latest release is missing {name}"))?;
+            .find(|asset| asset.name == asset_name)
+            .with_context(|| format!("latest release is missing {asset_name}"))?;
         let expected = checksums
-            .get(&name)
-            .with_context(|| format!("{name} is missing from SHA256SUMS"))?;
+            .get(&asset_name)
+            .with_context(|| format!("{asset_name} is missing from SHA256SUMS"))?;
         let bytes = download_release_asset(&client, asset).await?;
         let actual = format!("{:x}", Sha256::digest(&bytes));
         if &actual != expected {
-            anyhow::bail!("SHA-256 verification failed for {name}");
+            anyhow::bail!("SHA-256 verification failed for {asset_name}");
         }
-        binaries.push((name, bytes));
+        binaries.push((format!("{program}{suffix}"), bytes));
     }
     Ok(binaries)
 }
@@ -359,6 +372,15 @@ async fn download_release_asset(
 fn write_installed_binary(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     fs::write(path, bytes)?;
     set_executable_permissions(path)
+}
+
+fn create_install_bin_dir(bin_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(bin_dir).with_context(|| {
+        format!(
+            "cannot create {}; use sudo or choose a writable --prefix",
+            bin_dir.display()
+        )
+    })
 }
 
 fn set_executable_permissions(path: &Path) -> anyhow::Result<()> {
