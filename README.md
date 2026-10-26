@@ -32,11 +32,13 @@ sudo ./bin/oplire install
 sudo ./bin/oplire install --with-service
 ```
 
-Use `./bin/oplire install --help` to select a custom prefix, preview with
-`--dry-run`, or install directly from a published release with
-`./bin/oplire install --latest` (downloads and verifies all five binaries before
-writing them). The default Linux/macOS prefix is `/usr/local`; Windows installs
-to `%LOCALAPPDATA%\Programs\Oplire\bin`. On Windows, run the binaries from that
+Use `./bin/oplire install --help` to select a custom prefix or preview with
+`--dry-run`. To fetch the latest published binaries instead of using the
+archive's bundled ones, run `sudo ./bin/oplire install --latest` on Linux/macOS
+(omit `sudo` when using a writable `--prefix`). The installer downloads and
+SHA-256-verifies all five binaries before writing any of them. The default
+Linux/macOS prefix is `/usr/local`; Windows installs to
+`%LOCALAPPDATA%\Programs\Oplire\bin`. On Windows, run the binaries from that
 folder or add it to your user `PATH`.
 
 ## Binaries
