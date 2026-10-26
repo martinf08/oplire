@@ -5,6 +5,8 @@ pub struct ProxyConfig {
     pub listen_addr: String,
     pub upstream_base_url: String,
     pub api_key: Option<String>,
+    /// Explicit proxy used only for Oplire's outbound upstream requests.
+    pub egress_proxy: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -13,6 +15,7 @@ impl Default for ProxyConfig {
             listen_addr: "127.0.0.1:8080".to_string(),
             upstream_base_url: "http://127.0.0.1:3000".to_string(),
             api_key: None,
+            egress_proxy: None,
         }
     }
 }

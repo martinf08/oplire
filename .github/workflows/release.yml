@@ -1,0 +1,123 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            suffix: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            suffix: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            suffix: ""
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            suffix: ""
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            suffix: ".exe"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - name: Run target tests
+        run: cargo test --all-targets --locked
+      - name: Build executables
+        run: cargo build --release --bins --locked --target ${{ matrix.target }}
+      - name: Package Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          name="oplire-${GITHUB_REF_NAME}-${TARGET}"
+          stage="dist/${name}"
+          mkdir -p "${stage}/bin"
+          for binary in oplire proxy-rotate proxy-hunt reset-opencode reset-opencode-default; do
+            cp "target/${TARGET}/release/${binary}${SUFFIX}" "${stage}/bin/"
+            cp "target/${TARGET}/release/${binary}${SUFFIX}" "dist/${binary}-${TARGET}${SUFFIX}"
+          done
+          cp README.md LICENSE "${stage}/"
+          if [ "${PLATFORM}" = linux ]; then
+            mkdir -p "${stage}/systemd"
+            cp systemd/proxy-rotate.service "${stage}/systemd/"
+          fi
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -r -- "${stage}"
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "oplire-$env:GITHUB_REF_NAME-$env:TARGET"
+          $stage = Join-Path 'dist' $name
+          $bin = Join-Path $stage 'bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+          foreach ($binary in @('oplire', 'proxy-rotate', 'proxy-hunt', 'reset-opencode', 'reset-opencode-default')) {
+            $source = "target/$env:TARGET/release/$binary$env:SUFFIX"
+            Copy-Item $source $bin
+            Copy-Item $source (Join-Path 'dist' "$binary-$env:TARGET$env:SUFFIX")
+          }
+          Copy-Item README.md, LICENSE $stage
+          $archive = "$stage.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          Remove-Item -LiteralPath $stage -Recurse -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            --title "Oplire $GITHUB_REF_NAME" \
+            ./*

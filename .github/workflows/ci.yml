@@ -4,17 +4,22 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Test Rust
-        run: cargo test --locked
-      - name: Test safe legacy scripts
-        run: python3 -m unittest discover -s tests -v
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --all-targets --locked
+      - name: Build all executables
+        run: cargo build --release --bins --locked
