@@ -4,20 +4,14 @@ on:
   push:
     tags:
       - "v*"
-  pull_request:
-    paths:
-      - '.github/workflows/release.yml'
-      - 'Cargo.*'
-      - 'src/**'
-      - 'tests/**'
-      - 'systemd/**'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -111,7 +105,7 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   publish:
     name: Publish GitHub Release
@@ -134,8 +128,20 @@ jobs:
           set -euo pipefail
           cd release-assets
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS
+          {
+            echo '## Downloads'
+            echo 'Choose one complete archive for your OS and architecture. It includes all tools; Rust is not required.'
+            echo
+            for archive in ./*.tar.gz ./*.zip; do
+              file="${archive#./}"
+              printf -- '- [%s](https://github.com/%s/releases/download/%s/%s)\n' "$file" "$GH_REPO" "$GITHUB_REF_NAME" "$file"
+            done
+            echo
+            echo 'Verify downloads with SHA256SUMS. Individual executable assets are kept for compatibility with existing install --latest clients, not as additional builds. Most users need only one archive.'
+          } > "$RUNNER_TEMP/oplire-release-notes.md"
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
             --generate-notes \
+            --notes-file "$RUNNER_TEMP/oplire-release-notes.md" \
             --title "Oplire $GITHUB_REF_NAME" \
             ./*

@@ -2,7 +2,18 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.gitattributes'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.gitattributes'
 
 permissions:
   contents: read
@@ -15,6 +26,8 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -23,11 +36,16 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Cache Cargo dependencies and test build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            target/debug
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-debug-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo test --all-targets --locked
-      - name: Build all executables
-        run: cargo build --release --bins --locked
