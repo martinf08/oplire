@@ -68,3 +68,47 @@ fn reset_network_tool_exposes_dry_run_and_explicit_purge_options() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("--dry-run"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("--purge"));
 }
+
+#[test]
+fn cli_help_does_not_display_credentials_from_environment() {
+    let output = Command::new(env!("CARGO_BIN_EXE_oplire"))
+        .args(["proxy", "--help"])
+        .env("OPLIRE_API_KEY", "secret-api-key")
+        .env(
+            "OPLIRE_EGRESS_PROXY",
+            "http://alice:secret-password@localhost:8080",
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(!help.contains("secret-api-key"));
+    assert!(!help.contains("secret-password"));
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_bundle_can_reinstall_itself_without_truncating_the_running_binary() {
+    let root = TempDir::new().unwrap();
+    let prefix = root.path().join("prefix");
+    let install = |executable: &std::path::Path| {
+        let output = Command::new(executable)
+            .arg("install")
+            .arg("--prefix")
+            .arg(&prefix)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    install(std::path::Path::new(env!("CARGO_BIN_EXE_oplire")));
+    install(&prefix.join("bin/oplire"));
+    assert!(Command::new(prefix.join("bin/oplire"))
+        .arg("--version")
+        .status()
+        .unwrap()
+        .success());
+}

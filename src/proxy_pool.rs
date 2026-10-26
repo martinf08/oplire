@@ -238,7 +238,10 @@ fn parse_proxy(value: &str) -> Result<ProxyInput> {
     } else {
         format!("http://{value}")
     };
-    let url = Url::parse(&raw).with_context(|| format!("invalid proxy URL: {value}"))?;
+    let url = Url::parse(&raw).map_err(|_| anyhow!("invalid proxy URL"))?;
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        bail!("proxy URL must not contain a path, query, or fragment");
+    }
     let scheme = url.scheme().to_ascii_lowercase();
     if !matches!(scheme.as_str(), "http" | "socks5" | "socks5h") {
         bail!("unsupported proxy scheme {scheme}; use http:// or socks5://");
@@ -355,6 +358,8 @@ fn migrate_database(conn: &Connection) -> Result<()> {
 }
 
 fn set_private_file(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -438,6 +443,16 @@ fn insert_proxy(
     source: Option<&str>,
     seen: bool,
 ) -> Result<i64> {
+    // SQLite UNIQUE permits multiple NULL usernames; compare them explicitly
+    // without rewriting or deleting entries in existing user databases.
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM proxies WHERE scheme=?1 AND host=?2 AND port=?3 AND COALESCE(username,'')=COALESCE(?4,''))",
+        params![input.scheme, input.host, input.port, input.username],
+        |row| row.get(0),
+    )?;
+    if exists {
+        bail!("UNIQUE constraint failed: proxy already exists");
+    }
     let stamp = now();
     conn.execute(
         "INSERT INTO proxies(label,scheme,host,port,username,password,country,note,source,last_seen,created_at)
@@ -569,7 +584,7 @@ fn eligible_proxies(
             .unwrap_or(FRESHNESS_SECS),
     );
     rows.retain(|proxy| {
-        proxy.status == "active"
+        matches!(proxy.status.as_str(), "active" | "cooldown")
             && proxy.id != exclude.unwrap_or(-1)
             && proxy
                 .cooldown_until
@@ -592,10 +607,10 @@ fn eligible_proxies(
 }
 
 fn pick_proxy(conn: &Connection, exclude: Option<i64>) -> Result<Option<Proxy>> {
-    Ok(eligible_proxies(conn, exclude, true)?
-        .into_iter()
-        .next()
-        .or(eligible_proxies(conn, exclude, false)?.into_iter().next()))
+    if let Some(proxy) = eligible_proxies(conn, exclude, true)?.into_iter().next() {
+        return Ok(Some(proxy));
+    }
+    Ok(eligible_proxies(conn, exclude, false)?.into_iter().next())
 }
 
 fn apply_cooldown(conn: &Connection, proxy: &Proxy) -> Result<String> {
@@ -763,7 +778,7 @@ pub async fn run_cli() -> Result<i32> {
                 Command::Fail { id } => cmd_mark_fail(&paths, &conn, id)?,
                 Command::Test { id, all } => return cmd_test(&paths, &conn, id, all, 12).await,
                 Command::Refresh { jobs, timeout } => {
-                    return cmd_refresh(&paths, &conn, jobs, timeout).await
+                    return cmd_refresh(&conn, jobs, timeout).await
                 }
                 Command::Auto { action } => {
                     return cmd_auto(&paths, &conn, action.unwrap_or(AutoAction::Status)).await
@@ -840,7 +855,7 @@ fn cmd_import(conn: &Connection, file: &Path, source: &str) -> Result<()> {
             Err(error) => return Err(error),
         }
     }
-    println!("Import: {added} added, {refreshed} refreshed, 0 duplicates, {invalid} invalid");
+    println!("Import: {added} added, {refreshed} refreshed, {invalid} invalid");
     Ok(())
 }
 
@@ -1233,7 +1248,7 @@ async fn cmd_test(
     Ok(0)
 }
 
-async fn cmd_refresh(paths: &Paths, conn: &Connection, jobs: usize, timeout: u64) -> Result<i32> {
+async fn cmd_refresh(conn: &Connection, jobs: usize, timeout: u64) -> Result<i32> {
     use futures_util::StreamExt;
     let proxies = list_proxies(conn)?
         .into_iter()
@@ -1267,7 +1282,6 @@ async fn cmd_refresh(paths: &Paths, conn: &Connection, jobs: usize, timeout: u64
         Some(&format!("{connected} connected / {failed} failed")),
     )?;
     println!("Refresh: {connected} connected, {failed} unreachable ({} tested); HTTP status codes never trigger a route change.", connected + failed);
-    let _ = paths;
     Ok(0)
 }
 
@@ -1529,17 +1543,19 @@ async fn run_daemon(paths: Paths) -> Result<()> {
     Ok(())
 }
 
-fn current_upstream(paths: &Paths) -> Option<Proxy> {
-    let conn = open_database(paths, false).ok()?;
-    if get_setting(&conn, "mode", "direct").ok()?.as_str() != "local" {
-        return None;
+fn current_upstream(paths: &Paths) -> Result<Option<Proxy>> {
+    let conn = open_database(paths, false)?;
+    if get_setting(&conn, "mode", "direct")? != "local" {
+        return Ok(None);
     }
-    let id = get_setting(&conn, "current_id", "")
-        .ok()?
+    let id = get_setting(&conn, "current_id", "")?
         .parse::<i64>()
-        .ok()?;
-    let proxy = get_proxy(&conn, id).ok()?;
-    matches!(proxy.status.as_str(), "active" | "cooldown").then_some(proxy)
+        .context("no selected proxy in local mode")?;
+    let proxy = get_proxy(&conn, id)?;
+    if !matches!(proxy.status.as_str(), "active" | "cooldown") {
+        bail!("selected proxy is not available");
+    }
+    Ok(Some(proxy))
 }
 
 async fn serve_client(mut client: TcpStream, paths: &Paths) -> Result<()> {
@@ -1548,6 +1564,9 @@ async fn serve_client(mut client: TcpStream, paths: &Paths) -> Result<()> {
             Ok(result) => result.context("read client request")?,
             Err(_) => bail!("timed out reading client request headers"),
         };
+    // Client credentials belong to this proxy, never to the destination or to
+    // the selected upstream proxy (which has its own configured credentials).
+    let head = strip_proxy_authorization(&head);
     let first_line = head.split(|byte| *byte == b'\n').next().unwrap_or_default();
     let request_line = String::from_utf8_lossy(first_line)
         .trim_end_matches('\r')
@@ -1556,7 +1575,13 @@ async fn serve_client(mut client: TcpStream, paths: &Paths) -> Result<()> {
     let method = fields.next().context("invalid HTTP request line")?;
     let target = fields.next().context("invalid HTTP request line")?;
     let version = fields.next().unwrap_or("HTTP/1.1");
-    let upstream = current_upstream(paths);
+    let upstream = match current_upstream(paths) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            client.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            return Err(error);
+        }
+    };
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_authority(target)?;
@@ -1648,6 +1673,12 @@ async fn read_http_head(stream: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)
         }
         data.extend_from_slice(&chunk[..read]);
         if let Some(index) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            if index + 4 > HEADER_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP headers too large",
+                ));
+            }
             let rest = data.split_off(index + 4);
             return Ok((data, rest));
         }
@@ -1690,8 +1721,32 @@ fn proxy_authorization(proxy: &Proxy) -> String {
 }
 
 fn add_header(head: &[u8], name: &str, value: &str) -> Vec<u8> {
+    if value.is_empty() {
+        return head.to_vec();
+    }
     let mut output = head[..head.len().saturating_sub(4)].to_vec();
     output.extend_from_slice(format!("\r\n{name}: {value}\r\n\r\n").as_bytes());
+    output
+}
+
+fn strip_proxy_authorization(head: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(head.len());
+    let mut skipping = false;
+    for (index, line) in head.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if index == 0 {
+            output.extend_from_slice(line);
+            continue;
+        }
+        if !line.starts_with(b" ") && !line.starts_with(b"\t") {
+            skipping = line
+                .split(|byte| *byte == b':')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"proxy-authorization"));
+        }
+        if !skipping {
+            output.extend_from_slice(line);
+        }
+    }
     output
 }
 
@@ -1903,22 +1958,17 @@ async fn health_check(paths: &Paths) -> Result<()> {
 }
 
 fn auto_rotate_after_connectivity_failure(paths: &Paths, conn: &Connection) -> Result<()> {
-    let reason = "proxy unreachable";
-    if is_rate_limit_reason(reason) {
-        println!("[auto] provider limit detected; no proxy switch or retry.");
-        return Ok(());
-    }
+    // Called only after a failed connectivity probe; record_probe has already
+    // updated the failure count/status. Do not turn a dead proxy back into a
+    // cooldown entry here, or apply the cooldown twice.
     let current = current_proxy_id(paths, conn)?;
     if let Some(id) = current {
-        let proxy = get_proxy(conn, id)?;
-        let until = apply_cooldown(conn, &proxy)?;
         log_event(
             conn,
             Some(id),
             "connectivity_failure",
-            Some(&format!("{reason}; cooldown until {until}")),
+            Some("proxy unreachable"),
         )?;
-        println!("[auto] #{id} in cooldown until {until} UTC");
     }
     let Some(next) = pick_proxy(conn, current)? else {
         println!("[auto] no alternative proxy available; connection unchanged.");
@@ -1966,6 +2016,79 @@ mod tests {
             run_dir: root.path().join("run"),
             log_file: root.path().join("opencode.log"),
         }
+    }
+
+    #[test]
+    fn client_proxy_credentials_are_not_forwarded_to_the_destination() {
+        let request = b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nProxy-Authorization: Basic secret\r\n continuation\r\nAuthorization: Bearer upstream\r\n\r\n";
+        assert_eq!(strip_proxy_authorization(request), b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer upstream\r\n\r\n");
+    }
+
+    #[test]
+    fn duplicate_anonymous_proxies_are_rejected_without_modifying_the_pool() {
+        let root = TempDir::new().unwrap();
+        let conn = init_database(&test_paths(&root)).unwrap();
+        let input = parse_proxy("http://proxy.example:8080").unwrap();
+        insert_proxy(&conn, &input, None, None, None, None, false).unwrap();
+        assert!(insert_proxy(&conn, &input, None, None, None, None, false).is_err());
+        assert_eq!(list_proxies(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expired_cooldowns_become_eligible_without_a_reset() {
+        let root = TempDir::new().unwrap();
+        let conn = init_database(&test_paths(&root)).unwrap();
+        let input = parse_proxy("http://proxy.example:8080").unwrap();
+        let id = insert_proxy(&conn, &input, None, None, None, None, false).unwrap();
+        conn.execute(
+            "UPDATE proxies SET status='cooldown',cooldown_until=?1 WHERE id=?2",
+            params![timestamp_after(600), id],
+        )
+        .unwrap();
+        assert!(pick_proxy(&conn, None).unwrap().is_none());
+        conn.execute(
+            "UPDATE proxies SET cooldown_until=?1 WHERE id=?2",
+            params![timestamp_before(1), id],
+        )
+        .unwrap();
+        assert_eq!(pick_proxy(&conn, None).unwrap().unwrap().id, id);
+    }
+
+    #[test]
+    fn local_mode_does_not_silently_fall_back_to_a_direct_connection() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(&root);
+        let conn = init_database(&paths).unwrap();
+        assert!(current_upstream(&paths).unwrap().is_none());
+        set_setting(&conn, "mode", "local").unwrap();
+        assert!(current_upstream(&paths).is_err());
+        set_setting(&conn, "current_id", 123).unwrap();
+        assert!(current_upstream(&paths).is_err());
+    }
+
+    #[test]
+    fn connectivity_fallback_does_not_revive_a_dead_proxy() {
+        let root = TempDir::new().unwrap();
+        let paths = test_paths(&root);
+        let conn = init_database(&paths).unwrap();
+        let input = parse_proxy("http://proxy.example:8080").unwrap();
+        let id = insert_proxy(&conn, &input, None, None, None, None, false).unwrap();
+        set_setting(&conn, "mode", "local").unwrap();
+        set_setting(&conn, "current_id", id).unwrap();
+        conn.execute(
+            "UPDATE proxies SET status='dead',fail_count=3 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        auto_rotate_after_connectivity_failure(&paths, &conn).unwrap();
+        assert_eq!(get_proxy(&conn, id).unwrap().status, "dead");
+    }
+
+    #[test]
+    fn malformed_proxy_urls_do_not_disclose_passwords() {
+        let error = parse_proxy("http://alice:topsecret@host:invalid").unwrap_err();
+        assert!(!format!("{error:#}").contains("topsecret"));
+        assert!(parse_proxy("http://host:8080/path").is_err());
     }
 
     #[test]

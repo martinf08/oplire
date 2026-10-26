@@ -8,9 +8,18 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::{
     collections::HashMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 use tracing_subscriber::EnvFilter;
+
+const PROGRAMS: [&str; 5] = [
+    "oplire",
+    "proxy-rotate",
+    "proxy-hunt",
+    "reset-opencode",
+    "reset-opencode-default",
+];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,10 +47,10 @@ enum Command {
         )]
         upstream: String,
         /// Optional bearer token for the upstream.
-        #[arg(long, env = "OPLIRE_API_KEY")]
+        #[arg(long, env = "OPLIRE_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// Explicit HTTP(S) or SOCKS5 proxy for upstream traffic (for example, a local WARP proxy).
-        #[arg(long, env = "OPLIRE_EGRESS_PROXY")]
+        #[arg(long, env = "OPLIRE_EGRESS_PROXY", hide_env_values = true)]
         egress_proxy: Option<String>,
     },
     /// Check a URL with bounded retries for transient failures; never retries HTTP 429.
@@ -152,6 +161,19 @@ async fn install_release(
         }
     }
 
+    // Reject unsupported service setups before installing any files.
+    #[cfg(target_os = "linux")]
+    if with_service
+        && !ProcessCommand::new("systemctl")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        anyhow::bail!("systemd is required for --with-service");
+    }
+
     let bin_dir = prefix.join("bin");
     if latest {
         if dry_run {
@@ -182,14 +204,7 @@ async fn install_release(
         let executable = std::env::current_exe()?;
         let source_dir = executable.parent().unwrap_or_else(|| Path::new("."));
         let extension = if cfg!(windows) { ".exe" } else { "" };
-        let programs = [
-            "oplire",
-            "proxy-rotate",
-            "proxy-hunt",
-            "reset-opencode",
-            "reset-opencode-default",
-        ];
-        let sources = programs
+        let sources = PROGRAMS
             .iter()
             .map(|name| (*name, source_dir.join(format!("{name}{extension}"))))
             .collect::<Vec<_>>();
@@ -207,13 +222,13 @@ async fn install_release(
             create_install_bin_dir(&bin_dir)?;
             for (name, source) in &sources {
                 let destination = bin_dir.join(format!("{name}{extension}"));
-                fs::copy(source, &destination).with_context(|| {
+                let bytes = fs::read(source)?;
+                write_installed_binary(&destination, &bytes).with_context(|| {
                     format!(
                         "cannot install {}; use sudo or choose a writable --prefix",
                         destination.display()
                     )
                 })?;
-                set_executable_permissions(&destination)?;
                 println!("Installed {}", destination.display());
             }
         }
@@ -222,15 +237,6 @@ async fn install_release(
     if with_service {
         #[cfg(target_os = "linux")]
         {
-            if !ProcessCommand::new("systemctl")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                anyhow::bail!("systemd is required for --with-service");
-            }
             let service = include_str!("../systemd/proxy-rotate.service")
                 .replace("/usr/local/bin", &bin_dir.to_string_lossy());
             let service_path = Path::new("/etc/systemd/system/proxy-rotate.service");
@@ -271,6 +277,9 @@ struct GithubAsset {
 }
 
 fn release_target() -> anyhow::Result<&'static str> {
+    if cfg!(target_env = "musl") {
+        anyhow::bail!("prebuilt releases target GNU/glibc, not musl; build from source on Alpine");
+    }
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
@@ -285,18 +294,13 @@ async fn download_latest_binaries() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     const REPOSITORY: &str = "martinf08/oplire";
     let target = release_target()?;
     let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let programs = [
-        "oplire",
-        "proxy-rotate",
-        "proxy-hunt",
-        "reset-opencode",
-        "reset-opencode-default",
-    ];
-    let asset_names = programs
+    let asset_names = PROGRAMS
         .iter()
         .map(|name| format!("{name}-{target}{suffix}"))
         .collect::<Vec<_>>();
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
         .user_agent(concat!(
             "Oplire/",
             env!("CARGO_PKG_VERSION"),
@@ -332,7 +336,7 @@ async fn download_latest_binaries() -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         .collect::<HashMap<_, _>>();
 
     let mut binaries = Vec::with_capacity(asset_names.len());
-    for (program, asset_name) in programs.iter().zip(asset_names) {
+    for (program, asset_name) in PROGRAMS.iter().zip(asset_names) {
         let asset = release
             .assets
             .iter()
@@ -370,8 +374,15 @@ async fn download_release_asset(
 }
 
 fn write_installed_binary(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    fs::write(path, bytes)?;
-    set_executable_permissions(path)
+    // Stage beside the destination so Unix upgrades can replace a running
+    // executable, without truncating it if a write fails midway.
+    let parent = path.parent().context("installation path has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    set_executable_permissions(staged.path())?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn create_install_bin_dir(bin_dir: &Path) -> anyhow::Result<()> {
@@ -384,10 +395,35 @@ fn create_install_bin_dir(bin_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn set_executable_permissions(path: &Path) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_installation_replaces_existing_files_without_leftovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("oplire");
+        fs::write(&destination, b"old binary").unwrap();
+        write_installed_binary(&destination, b"new binary").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new binary");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
 }

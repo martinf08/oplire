@@ -384,25 +384,33 @@ fn transform_models(upstream: &Value) -> Value {
                 .filter_map(|model| {
                     let id = model.get("id")?.as_str()?;
                     let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
-                    Some(json!({
+                    let mut entry = json!({
                         "id": id,
                         "name": name,
                         "display_name": name,
-                        "type": "model",
-                        "context_window": model.get("context_window").cloned().unwrap_or(json!(128000)),
-                        "input_price": model.get("input_price").cloned().unwrap_or(json!(0.0)),
-                        "output_price": model.get("output_price").cloned().unwrap_or(json!(0.0))
-                    }))
+                        "type": "model"
+                    });
+                    for field in ["context_window", "input_price", "output_price"] {
+                        if let Some(value) = model.get(field) {
+                            entry[field] = value.clone();
+                        }
+                    }
+                    Some(entry)
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| ProxyConfig::models_response()["data"].as_array().cloned().unwrap_or_default());
+        .unwrap_or_else(|| {
+            ProxyConfig::models_response()["data"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        });
     json!({"data": data, "has_more": false})
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_messages, validate_anthropic_request};
+    use super::{handle_messages, transform_models, validate_anthropic_request};
     use crate::{config::ProxyConfig, proxy::handlers::ProxyState};
     use axum::{
         body::{to_bytes, Body},
@@ -419,6 +427,15 @@ mod tests {
         Arc,
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn model_catalogue_does_not_invent_pricing_or_context_limits() {
+        let models = transform_models(&json!({"data": [{"id": "example"}]}));
+        assert!(models["data"][0].get("input_price").is_none());
+        assert!(models["data"][0].get("context_window").is_none());
+        let models = transform_models(&json!({"data": [{"id": "example", "input_price": 1.5}]}));
+        assert_eq!(models["data"][0]["input_price"], 1.5);
+    }
 
     #[test]
     fn rejects_images_and_tool_calls_instead_of_dropping_them() {

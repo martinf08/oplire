@@ -39,10 +39,7 @@ impl ProxyConfig {
                     "id": id,
                     "name": name,
                     "type": "model",
-                    "display_name": name,
-                    "context_window": 128000,
-                    "input_price": 0.0,
-                    "output_price": 0.0
+                    "display_name": name
                 })
             })
             .collect();
